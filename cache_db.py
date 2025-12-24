@@ -28,7 +28,8 @@ def normalize_key(value: str) -> str:
 def get_cache_entry(
     market: Optional[str] = None,
     team: Optional[str] = None,
-    player: Optional[str] = None
+    player: Optional[str] = None,
+    sport: Optional[str] = None
 ) -> Optional[Dict[str, Any]]:
     """
     Retrieve cache entry based on provided parameters.
@@ -37,6 +38,7 @@ def get_cache_entry(
         market: Market type to look up
         team: Team name to look up
         player: Player name to look up
+        sport: Sport name (required when searching by team)
     
     Returns:
         Dictionary with cache entry data or None if not found
@@ -49,16 +51,31 @@ def get_cache_entry(
         # Priority: team > player > market
         if team:
             normalized_team = normalize_key(team)
-            # Search for team by name (case-insensitive)
-            cursor.execute("""
-                SELECT t.id, t.name, t.abbreviation, t.city, t.mascot, t.nickname,
-                       l.name as league_name, s.name as sport_name
-                FROM teams t
-                LEFT JOIN leagues l ON t.league_id = l.id
-                LEFT JOIN sports s ON t.sport_id = s.id
-                WHERE LOWER(t.name) = ? OR LOWER(t.nickname) = ? OR LOWER(t.abbreviation) = ?
-                LIMIT 1
-            """, (normalized_team, normalized_team, normalized_team))
+            normalized_sport = normalize_key(sport) if sport else None
+            
+            # Search for team by name AND sport (case-insensitive)
+            if normalized_sport:
+                cursor.execute("""
+                    SELECT t.id, t.name, t.abbreviation, t.city, t.mascot, t.nickname,
+                           l.name as league_name, s.name as sport_name
+                    FROM teams t
+                    LEFT JOIN leagues l ON t.league_id = l.id
+                    LEFT JOIN sports s ON t.sport_id = s.id
+                    WHERE (LOWER(t.name) = ? OR LOWER(t.nickname) = ? OR LOWER(t.abbreviation) = ?)
+                      AND LOWER(s.name) = ?
+                    LIMIT 1
+                """, (normalized_team, normalized_team, normalized_team, normalized_sport))
+            else:
+                # Fallback if sport not provided (shouldn't happen due to API validation)
+                cursor.execute("""
+                    SELECT t.id, t.name, t.abbreviation, t.city, t.mascot, t.nickname,
+                           l.name as league_name, s.name as sport_name
+                    FROM teams t
+                    LEFT JOIN leagues l ON t.league_id = l.id
+                    LEFT JOIN sports s ON t.sport_id = s.id
+                    WHERE LOWER(t.name) = ? OR LOWER(t.nickname) = ? OR LOWER(t.abbreviation) = ?
+                    LIMIT 1
+                """, (normalized_team, normalized_team, normalized_team))
             
             result = cursor.fetchone()
             if result:
