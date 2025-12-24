@@ -53,7 +53,7 @@ def get_cache_entry(
             normalized_team = normalize_key(team)
             normalized_sport = normalize_key(sport) if sport else None
             
-            # Search for team by name AND sport (case-insensitive)
+            # Search for ALL teams matching name AND sport (case-insensitive)
             if normalized_sport:
                 cursor.execute("""
                     SELECT t.id, t.name, t.abbreviation, t.city, t.mascot, t.nickname,
@@ -61,10 +61,10 @@ def get_cache_entry(
                     FROM teams t
                     LEFT JOIN leagues l ON t.league_id = l.id
                     LEFT JOIN sports s ON t.sport_id = s.id
-                    WHERE (LOWER(t.name) = ? OR LOWER(t.nickname) = ? OR LOWER(t.abbreviation) = ?)
+                    WHERE (LOWER(t.name) LIKE ? OR LOWER(t.nickname) LIKE ? OR LOWER(t.abbreviation) = ?)
                       AND LOWER(s.name) = ?
-                    LIMIT 1
-                """, (normalized_team, normalized_team, normalized_team, normalized_sport))
+                    ORDER BY t.name
+                """, (f'%{normalized_team}%', f'%{normalized_team}%', normalized_team, normalized_sport))
             else:
                 # Fallback if sport not provided (shouldn't happen due to API validation)
                 cursor.execute("""
@@ -73,37 +73,47 @@ def get_cache_entry(
                     FROM teams t
                     LEFT JOIN leagues l ON t.league_id = l.id
                     LEFT JOIN sports s ON t.sport_id = s.id
-                    WHERE LOWER(t.name) = ? OR LOWER(t.nickname) = ? OR LOWER(t.abbreviation) = ?
-                    LIMIT 1
-                """, (normalized_team, normalized_team, normalized_team))
+                    WHERE LOWER(t.name) LIKE ? OR LOWER(t.nickname) LIKE ? OR LOWER(t.abbreviation) = ?
+                    ORDER BY t.name
+                """, (f'%{normalized_team}%', f'%{normalized_team}%', normalized_team))
             
-            result = cursor.fetchone()
-            if result:
-                team_id = result["id"]
+            results = cursor.fetchall()
+            if results:
+                teams_data = []
                 
-                # Get all players for this team (ONE-TO-MANY relationship)
-                cursor.execute("""
-                    SELECT p.id, p.name, p.first_name, p.last_name, p.position, 
-                           p.number, p.age, p.height, p.weight
-                    FROM players p
-                    WHERE p.team_id = ?
-                    ORDER BY p.name
-                """, (team_id,))
-                
-                players = [dict(row) for row in cursor.fetchall()]
+                # Process each matching team
+                for result in results:
+                    team_id = result["id"]
+                    
+                    # Get all players for this team (ONE-TO-MANY relationship)
+                    cursor.execute("""
+                        SELECT p.id, p.name, p.first_name, p.last_name, p.position, 
+                               p.number, p.age, p.height, p.weight
+                        FROM players p
+                        WHERE p.team_id = ?
+                        ORDER BY p.name
+                    """, (team_id,))
+                    
+                    players = [dict(row) for row in cursor.fetchall()]
+                    
+                    teams_data.append({
+                        "id": result["id"],
+                        "normalized_name": result["name"],
+                        "abbreviation": result["abbreviation"],
+                        "city": result["city"],
+                        "mascot": result["mascot"],
+                        "nickname": result["nickname"],
+                        "league": result["league_name"],
+                        "sport": result["sport_name"],
+                        "players": players,
+                        "player_count": len(players)
+                    })
                 
                 return {
                     "type": "team",
                     "query": team,
-                    "normalized_name": result["name"],
-                    "abbreviation": result["abbreviation"],
-                    "city": result["city"],
-                    "mascot": result["mascot"],
-                    "nickname": result["nickname"],
-                    "league": result["league_name"],
-                    "sport": result["sport_name"],
-                    "players": players,
-                    "player_count": len(players)
+                    "teams": teams_data,
+                    "team_count": len(teams_data)
                 }
         
         if player:
