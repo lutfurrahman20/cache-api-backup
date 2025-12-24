@@ -38,21 +38,46 @@ curl "http://142.44.160.36:8001/cache?market=moneyline"
 
 **Response Format:**
 
+**Team Search (returns all matching teams):**
 ```json
 {
   "found": true,
   "data": {
     "type": "team",
-    "query": "Lakers",
-    "normalized_name": "Los Angeles Lakers",
-    "abbreviation": "LAL",
-    "league": "NBA",
-    "aliases": ["LA Lakers", "Lakers", "L.A. Lakers"]
+    "query": "Barcelona",
+    "teams": [
+      {
+        "id": "ABC123",
+        "normalized_name": "FC Barcelona",
+        "abbreviation": "BAR",
+        "city": "Barcelona",
+        "mascot": null,
+        "nickname": "Barça",
+        "league": "La Liga",
+        "sport": "Soccer",
+        "players": [...],
+        "player_count": 25
+      },
+      {
+        "id": "XYZ789",
+        "normalized_name": "Barcelona SC",
+        "abbreviation": "BSC",
+        "city": "Guayaquil",
+        "mascot": null,
+        "nickname": "Los Toreros",
+        "league": "Ecuador - Serie A",
+        "sport": "Soccer",
+        "players": [...],
+        "player_count": 20
+      }
+    ],
+    "team_count": 2
   },
   "query": {
     "market": null,
-    "team": "Lakers",
-    "player": null
+    "team": "Barcelona",
+    "player": null,
+    "sport": "Soccer"
   }
 }
 ```
