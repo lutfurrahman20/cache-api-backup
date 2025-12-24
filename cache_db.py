@@ -62,6 +62,19 @@ def get_cache_entry(
             
             result = cursor.fetchone()
             if result:
+                team_id = result["id"]
+                
+                # Get all players for this team (ONE-TO-MANY relationship)
+                cursor.execute("""
+                    SELECT p.id, p.name, p.first_name, p.last_name, p.position, 
+                           p.number, p.age, p.height, p.weight
+                    FROM players p
+                    WHERE p.team_id = ?
+                    ORDER BY p.name
+                """, (team_id,))
+                
+                players = [dict(row) for row in cursor.fetchall()]
+                
                 return {
                     "type": "team",
                     "query": team,
@@ -71,7 +84,9 @@ def get_cache_entry(
                     "mascot": result["mascot"],
                     "nickname": result["nickname"],
                     "league": result["league_name"],
-                    "sport": result["sport_name"]
+                    "sport": result["sport_name"],
+                    "players": players,
+                    "player_count": len(players)
                 }
         
         if player:
