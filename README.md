@@ -21,12 +21,13 @@ Retrieve normalized cache entries.
 - `market` (optional): Market type (e.g., "moneyline", "spread", "total")
 - `team` (optional): Team name to look up
 - `player` (optional): Player name to look up
+- `sport` (optional): Sport name - **required when searching by team**
 
 **Examples:**
 
 ```bash
-# Look up a team
-curl "http://142.44.160.36:8001/cache?team=Lakers"
+# Look up a team (sport is required)
+curl "http://142.44.160.36:8001/cache?team=Lakers&sport=Basketball"
 
 # Look up a player
 curl "http://142.44.160.36:8001/cache?player=LeBron%20James"

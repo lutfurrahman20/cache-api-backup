@@ -33,7 +33,8 @@ async def health_check():
 async def get_cache(
     market: Optional[str] = Query(None, description="Market type (e.g., 'moneyline', 'spread', 'total')"),
     team: Optional[str] = Query(None, description="Team name to look up"),
-    player: Optional[str] = Query(None, description="Player name to look up")
+    player: Optional[str] = Query(None, description="Player name to look up"),
+    sport: Optional[str] = Query(None, description="Sport name (required when searching by team)")
 ) -> JSONResponse:
     """
     Get normalized cache entry for market, team, or player.
@@ -42,12 +43,13 @@ async def get_cache(
     - market: Market type to look up
     - team: Team name to normalize
     - player: Player name to normalize
+    - sport: Sport name (required when searching by team)
     
     Returns:
     - Mapped/normalized entry from cache database
     
     Examples:
-    - /cache?team=Lakers
+    - /cache?team=Lakers&sport=Basketball
     - /cache?player=LeBron James
     - /cache?market=moneyline
     """
@@ -59,9 +61,16 @@ async def get_cache(
             detail="At least one parameter (market, team, or player) must be provided"
         )
     
+    # Validate that sport is provided when searching by team
+    if team and not sport:
+        raise HTTPException(
+            status_code=400,
+            detail="Sport parameter is required when searching by team"
+        )
+    
     # Get the cache entry
     try:
-        result = get_cache_entry(market=market, team=team, player=player)
+        result = get_cache_entry(market=market, team=team, player=player, sport=sport)
         
         if result is None:
             return JSONResponse(
@@ -72,7 +81,8 @@ async def get_cache(
                     "query": {
                         "market": market,
                         "team": team,
-                        "player": player
+                        "player": player,
+                        "sport": sport
                     }
                 }
             )
@@ -85,7 +95,8 @@ async def get_cache(
                 "query": {
                     "market": market,
                     "team": team,
-                    "player": player
+                    "player": player,
+                    "sport": sport
                 }
             }
         )
