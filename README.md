@@ -228,10 +228,23 @@ The application uses a SQLite database (`sports_data.db`) containing:
 - **Players**: Player details with team and league associations
 - **Markets**: Betting market types and associations
 
+### Database Relationships
+
+- **ONE-TO-MANY**: Team → Players
+  - One team can have many players
+  - When querying a team, all its players are returned
+  
+- **ONE-TO-ONE**: Player → Team
+  - Each player belongs to exactly one team
+  - Players have a single `team_id` foreign key
+  - Foreign key constraints ensure data integrity
+
 The database is accessed through `cache_db.py` which provides query functions for:
-- Team lookups (by name, abbreviation, or nickname)
-- Player lookups (by full name)
-- Market lookups (by market name)
+- **Team lookups**: By name, abbreviation, or nickname (with sport filter)
+  - Returns all matching teams with their complete player rosters
+- **Player lookups**: By full name (exact match)
+  - Returns all players with that name and their team information
+- **Market lookups**: By market name
 
 ## Monitoring & Logs
 

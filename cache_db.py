@@ -34,10 +34,14 @@ def get_cache_entry(
     """
     Retrieve cache entry based on provided parameters.
     
+    Relationships:
+    - ONE-TO-MANY: Team → Players (one team has many players)
+    - ONE-TO-ONE: Player → Team (each player belongs to exactly one team)
+    
     Args:
         market: Market type to look up
-        team: Team name to look up
-        player: Player name to look up
+        team: Team name to look up (returns team with all its players)
+        player: Player name to look up (returns player with their one team)
         sport: Sport name (required when searching by team)
     
     Returns:
