@@ -76,6 +76,9 @@ Thumbs.db
 logs/
 
 # Database files (when real DB is added)
-*.db
+# *.db files are tracked via Git LFS
+# Ignore SQLite files except the main database
 *.sqlite
 *.sqlite3
+# Allow sports_data.db to be tracked
+!sports_data.db
