@@ -6,7 +6,7 @@ A FastAPI-based cache normalization service for sports betting data (teams, play
 
 - **RESTful API** for cache lookups
 - **Flexible queries** supporting market, team, or player parameters
-- **Placeholder database** ready for future integration
+- **SQLite database** with comprehensive sports data (teams, players, markets)
 - **Automated deployment** via GitHub Actions
 - **Systemd service** management
 
@@ -180,47 +180,32 @@ The GitHub Actions workflow will:
 ## Project Structure
 
 ```
-cache api/
+cache-api/
 ├── .github/
 │   └── workflows/
 │       └── deploy.yml          # GitHub Actions deployment workflow
 ├── main.py                      # FastAPI application
-├── cache_db.py                  # Placeholder cache database
+├── cache_db.py                  # Database access layer
+├── sports_data.db              # SQLite database with sports data
 ├── requirements.txt             # Python dependencies
 ├── cache-api.service           # Systemd service configuration
 ├── .gitignore                  # Git ignore patterns
 └── README.md                   # This file
 ```
 
-## Placeholder Database
+## Database
 
-The current implementation uses a simple in-memory placeholder (`cache_db.py`) with sample data:
+The application uses a SQLite database (`sports_data.db`) containing:
 
-- **Teams**: Lakers, Celtics, Warriors
-- **Players**: LeBron James, Stephen Curry
-- **Markets**: Moneyline, Spread, Total
+- **Sports**: Various sports with leagues
+- **Teams**: Team information including abbreviations, cities, mascots
+- **Players**: Player details with team and league associations
+- **Markets**: Betting market types and associations
 
-### Future Database Integration
-
-To integrate a real database:
-
-1. Update `cache_db.py` with your database connection
-2. Replace the `PLACEHOLDER_CACHE` dictionary with database queries
-3. Keep the same function signatures for compatibility
-4. Add database dependencies to `requirements.txt`
-
-Example structure for database integration:
-
-```python
-# cache_db.py (future implementation)
-import asyncpg  # or your database library
-
-async def get_cache_entry(market=None, team=None, player=None):
-    # Connect to database
-    # Execute queries
-    # Return results
-    pass
-```
+The database is accessed through `cache_db.py` which provides query functions for:
+- Team lookups (by name, abbreviation, or nickname)
+- Player lookups (by full name)
+- Market lookups (by market name)
 
 ## Monitoring & Logs
 

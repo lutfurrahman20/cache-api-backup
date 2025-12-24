@@ -1,67 +1,21 @@
 """
-Cache Database Module (Placeholder)
-This is a placeholder implementation that will be replaced with actual database integration.
+Cache Database Module
+Provides database access to sports data using SQLite.
 """
 
-from typing import Optional, Dict, Any
+import sqlite3
+import os
+from typing import Optional, Dict, Any, List
 
-# Placeholder cache data
-# TODO: Replace with actual database connection and queries
-PLACEHOLDER_CACHE = {
-    "teams": {
-        "lakers": {
-            "normalized_name": "Los Angeles Lakers",
-            "abbreviation": "LAL",
-            "league": "NBA",
-            "aliases": ["LA Lakers", "Lakers", "L.A. Lakers"]
-        },
-        "celtics": {
-            "normalized_name": "Boston Celtics",
-            "abbreviation": "BOS",
-            "league": "NBA",
-            "aliases": ["Celtics", "Boston"]
-        },
-        "warriors": {
-            "normalized_name": "Golden State Warriors",
-            "abbreviation": "GSW",
-            "league": "NBA",
-            "aliases": ["GS Warriors", "Warriors", "Golden State"]
-        }
-    },
-    "players": {
-        "lebron james": {
-            "normalized_name": "LeBron James",
-            "team": "Los Angeles Lakers",
-            "position": "F",
-            "league": "NBA",
-            "aliases": ["LeBron", "LBJ", "King James"]
-        },
-        "stephen curry": {
-            "normalized_name": "Stephen Curry",
-            "team": "Golden State Warriors",
-            "position": "G",
-            "league": "NBA",
-            "aliases": ["Steph Curry", "Curry"]
-        }
-    },
-    "markets": {
-        "moneyline": {
-            "normalized_name": "Moneyline",
-            "category": "match_result",
-            "aliases": ["ML", "Money Line", "Win"]
-        },
-        "spread": {
-            "normalized_name": "Point Spread",
-            "category": "handicap",
-            "aliases": ["Handicap", "Line", "Spread"]
-        },
-        "total": {
-            "normalized_name": "Over/Under",
-            "category": "totals",
-            "aliases": ["O/U", "Over Under", "Totals"]
-        }
-    }
-}
+# Database file path
+DB_PATH = os.path.join(os.path.dirname(__file__), "sports_data.db")
+
+
+def get_db_connection():
+    """Create and return a database connection"""
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 
 def normalize_key(value: str) -> str:
@@ -88,48 +42,151 @@ def get_cache_entry(
         Dictionary with cache entry data or None if not found
     """
     
-    # Priority: team > player > market
-    if team:
-        normalized_team = normalize_key(team)
-        if normalized_team in PLACEHOLDER_CACHE["teams"]:
-            return {
-                "type": "team",
-                "query": team,
-                **PLACEHOLDER_CACHE["teams"][normalized_team]
-            }
+    conn = get_db_connection()
+    cursor = conn.cursor()
     
-    if player:
-        normalized_player = normalize_key(player)
-        if normalized_player in PLACEHOLDER_CACHE["players"]:
-            return {
-                "type": "player",
-                "query": player,
-                **PLACEHOLDER_CACHE["players"][normalized_player]
-            }
+    try:
+        # Priority: team > player > market
+        if team:
+            normalized_team = normalize_key(team)
+            # Search for team by name (case-insensitive)
+            cursor.execute("""
+                SELECT t.id, t.name, t.abbreviation, t.city, t.mascot, t.nickname,
+                       l.name as league_name, s.name as sport_name
+                FROM teams t
+                LEFT JOIN leagues l ON t.league_id = l.id
+                LEFT JOIN sports s ON t.sport_id = s.id
+                WHERE LOWER(t.name) = ? OR LOWER(t.nickname) = ? OR LOWER(t.abbreviation) = ?
+                LIMIT 1
+            """, (normalized_team, normalized_team, normalized_team))
+            
+            result = cursor.fetchone()
+            if result:
+                return {
+                    "type": "team",
+                    "query": team,
+                    "normalized_name": result["name"],
+                    "abbreviation": result["abbreviation"],
+                    "city": result["city"],
+                    "mascot": result["mascot"],
+                    "nickname": result["nickname"],
+                    "league": result["league_name"],
+                    "sport": result["sport_name"]
+                }
+        
+        if player:
+            normalized_player = normalize_key(player)
+            # Search for player by name (case-insensitive)
+            cursor.execute("""
+                SELECT p.id, p.name, p.first_name, p.last_name, p.position, p.number,
+                       t.name as team_name, l.name as league_name, s.name as sport_name
+                FROM players p
+                LEFT JOIN teams t ON p.team_id = t.id
+                LEFT JOIN leagues l ON p.league_id = l.id
+                LEFT JOIN sports s ON p.sport_id = s.id
+                WHERE LOWER(p.name) = ? OR LOWER(p.first_name || ' ' || p.last_name) = ?
+                LIMIT 1
+            """, (normalized_player, normalized_player))
+            
+            result = cursor.fetchone()
+            if result:
+                return {
+                    "type": "player",
+                    "query": player,
+                    "normalized_name": result["name"],
+                    "first_name": result["first_name"],
+                    "last_name": result["last_name"],
+                    "position": result["position"],
+                    "number": result["number"],
+                    "team": result["team_name"],
+                    "league": result["league_name"],
+                    "sport": result["sport_name"]
+                }
+        
+        if market:
+            normalized_market = normalize_key(market)
+            # Search for market by name (case-insensitive)
+            cursor.execute("""
+                SELECT m.id, m.name, m.market_type_id
+                FROM markets m
+                WHERE LOWER(m.name) = ?
+                LIMIT 1
+            """, (normalized_market,))
+            
+            result = cursor.fetchone()
+            if result:
+                # Get associated sports for this market
+                cursor.execute("""
+                    SELECT s.name
+                    FROM market_sports ms
+                    JOIN sports s ON ms.sport_id = s.id
+                    WHERE ms.market_id = ?
+                """, (result["id"],))
+                sports = [row["name"] for row in cursor.fetchall()]
+                
+                return {
+                    "type": "market",
+                    "query": market,
+                    "normalized_name": result["name"],
+                    "market_type_id": result["market_type_id"],
+                    "sports": sports
+                }
+        
+        # No match found
+        return None
+        
+    finally:
+        conn.close()
+
+
+def get_all_teams() -> List[Dict[str, Any]]:
+    """Get all teams from database"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
     
-    if market:
-        normalized_market = normalize_key(market)
-        if normalized_market in PLACEHOLDER_CACHE["markets"]:
-            return {
-                "type": "market",
-                "query": market,
-                **PLACEHOLDER_CACHE["markets"][normalized_market]
-            }
+    try:
+        cursor.execute("""
+            SELECT t.id, t.name, t.abbreviation, l.name as league_name, s.name as sport_name
+            FROM teams t
+            LEFT JOIN leagues l ON t.league_id = l.id
+            LEFT JOIN sports s ON t.sport_id = s.id
+        """)
+        
+        return [dict(row) for row in cursor.fetchall()]
+    finally:
+        conn.close()
+
+
+def get_all_players() -> List[Dict[str, Any]]:
+    """Get all players from database"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
     
-    # No match found
-    return None
+    try:
+        cursor.execute("""
+            SELECT p.id, p.name, p.position, t.name as team_name, l.name as league_name, s.name as sport_name
+            FROM players p
+            LEFT JOIN teams t ON p.team_id = t.id
+            LEFT JOIN leagues l ON p.league_id = l.id
+            LEFT JOIN sports s ON p.sport_id = s.id
+        """)
+        
+        return [dict(row) for row in cursor.fetchall()]
+    finally:
+        conn.close()
 
 
-def get_all_teams() -> Dict[str, Any]:
-    """Get all teams from cache (for future use)"""
-    return PLACEHOLDER_CACHE["teams"]
-
-
-def get_all_players() -> Dict[str, Any]:
-    """Get all players from cache (for future use)"""
-    return PLACEHOLDER_CACHE["players"]
-
-
-def get_all_markets() -> Dict[str, Any]:
-    """Get all markets from cache (for future use)"""
-    return PLACEHOLDER_CACHE["markets"]
+def get_all_markets() -> List[Dict[str, Any]]:
+    """Get all markets from database"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    try:
+        cursor.execute("""
+            SELECT m.id, m.name, m.market_type_id
+            FROM markets m
+        """)
+        
+        return [dict(row) for row in cursor.fetchall()]
+    finally:
+        conn.close()
