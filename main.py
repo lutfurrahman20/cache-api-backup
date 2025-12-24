@@ -61,7 +61,7 @@ async def get_cache(
             detail="At least one parameter (market, team, or player) must be provided"
         )
     
-    # Validate that sport is provided when searching by team (but not when both player and team are provided)
+    # Validate that sport is provided when searching by team (unless both team and player provided)
     if team and not player and not sport:
         raise HTTPException(
             status_code=400,

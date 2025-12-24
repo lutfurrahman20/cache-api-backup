@@ -23,25 +23,23 @@ Retrieve normalized cache entries.
 - `player` (optional): Player name to look up
 - `sport` (optional): Sport name - **required when searching by team only**
 
-**Query Priority:**
+**Search Modes:**
 
-When multiple parameters are provided:
-1. **Player + Team**: Returns only the player data filtered by team (e.g., "Mbappé" on "Real Madrid")
-2. **Player only**: Returns all players with that exact name
-3. **Team + Sport**: Returns team(s) with all their players
-4. **Market**: Returns market information
+1. **Team only**: Returns all matching teams with their players (sport required)
+2. **Player only**: Returns all matching players with their team info
+3. **Team + Player**: Returns only the specified player from the specified team (most specific)
 
 **Examples:**
 
 ```bash
-# Look up a specific player on a specific team
-curl "http://142.44.160.36:8001/cache?player=Mbappé&team=Real Madrid"
-
-# Look up a team (sport is required when searching team only)
+# Look up a team (sport is required)
 curl "http://142.44.160.36:8001/cache?team=Lakers&sport=Basketball"
 
-# Look up a player (returns all players with that name)
+# Look up a player
 curl "http://142.44.160.36:8001/cache?player=LeBron%20James"
+
+# Look up a specific player on a specific team (most precise)
+curl "http://142.44.160.36:8001/cache?player=Kylian%20Mbappé&team=Real%20Madrid%20CF"
 
 # Look up a market
 curl "http://142.44.160.36:8001/cache?market=moneyline"
