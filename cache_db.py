@@ -53,7 +53,8 @@ def get_cache_entry(
             normalized_team = normalize_key(team)
             normalized_sport = normalize_key(sport) if sport else None
             
-            # Search for ALL teams matching name AND sport (case-insensitive)
+            # Search for ALL teams with EXACT name match AND sport (case-insensitive)
+            # Checks name, nickname, or abbreviation for exact match
             if normalized_sport:
                 cursor.execute("""
                     SELECT t.id, t.name, t.abbreviation, t.city, t.mascot, t.nickname,
@@ -61,10 +62,10 @@ def get_cache_entry(
                     FROM teams t
                     LEFT JOIN leagues l ON t.league_id = l.id
                     LEFT JOIN sports s ON t.sport_id = s.id
-                    WHERE (LOWER(t.name) LIKE ? OR LOWER(t.nickname) LIKE ? OR LOWER(t.abbreviation) = ?)
+                    WHERE (LOWER(t.name) = ? OR LOWER(t.nickname) = ? OR LOWER(t.abbreviation) = ?)
                       AND LOWER(s.name) = ?
                     ORDER BY t.name
-                """, (f'%{normalized_team}%', f'%{normalized_team}%', normalized_team, normalized_sport))
+                """, (normalized_team, normalized_team, normalized_team, normalized_sport))
             else:
                 # Fallback if sport not provided (shouldn't happen due to API validation)
                 cursor.execute("""
@@ -73,9 +74,9 @@ def get_cache_entry(
                     FROM teams t
                     LEFT JOIN leagues l ON t.league_id = l.id
                     LEFT JOIN sports s ON t.sport_id = s.id
-                    WHERE LOWER(t.name) LIKE ? OR LOWER(t.nickname) LIKE ? OR LOWER(t.abbreviation) = ?
+                    WHERE LOWER(t.name) = ? OR LOWER(t.nickname) = ? OR LOWER(t.abbreviation) = ?
                     ORDER BY t.name
-                """, (f'%{normalized_team}%', f'%{normalized_team}%', normalized_team))
+                """, (normalized_team, normalized_team, normalized_team))
             
             results = cursor.fetchall()
             if results:
@@ -118,31 +119,44 @@ def get_cache_entry(
         
         if player:
             normalized_player = normalize_key(player)
-            # Search for player by name (case-insensitive)
+            # Search for ALL players with EXACT name match (case-insensitive)
             cursor.execute("""
                 SELECT p.id, p.name, p.first_name, p.last_name, p.position, p.number,
+                       p.age, p.height, p.weight,
                        t.name as team_name, l.name as league_name, s.name as sport_name
                 FROM players p
                 LEFT JOIN teams t ON p.team_id = t.id
                 LEFT JOIN leagues l ON p.league_id = l.id
                 LEFT JOIN sports s ON p.sport_id = s.id
                 WHERE LOWER(p.name) = ? OR LOWER(p.first_name || ' ' || p.last_name) = ?
-                LIMIT 1
+                ORDER BY p.name
             """, (normalized_player, normalized_player))
             
-            result = cursor.fetchone()
-            if result:
+            results = cursor.fetchall()
+            if results:
+                players_data = []
+                
+                for result in results:
+                    players_data.append({
+                        "id": result["id"],
+                        "normalized_name": result["name"],
+                        "first_name": result["first_name"],
+                        "last_name": result["last_name"],
+                        "position": result["position"],
+                        "number": result["number"],
+                        "age": result["age"],
+                        "height": result["height"],
+                        "weight": result["weight"],
+                        "team": result["team_name"],
+                        "league": result["league_name"],
+                        "sport": result["sport_name"]
+                    })
+                
                 return {
                     "type": "player",
                     "query": player,
-                    "normalized_name": result["name"],
-                    "first_name": result["first_name"],
-                    "last_name": result["last_name"],
-                    "position": result["position"],
-                    "number": result["number"],
-                    "team": result["team_name"],
-                    "league": result["league_name"],
-                    "sport": result["sport_name"]
+                    "players": players_data,
+                    "player_count": len(players_data)
                 }
         
         if market:
