@@ -15,9 +15,86 @@ from typing import Optional, Dict, Any, List
 from pydantic import BaseModel
 import uvicorn
 import os
+import platform
 import time
 from collections import defaultdict
 from dotenv import load_dotenv
+
+# Load environment variables early so that imported modules can
+# pick them up (redis_cache reads vars at import time).
+load_dotenv()
+
+# If running on Windows or otherwise in a "local" context and the
+# REDIS_HOST hasn't been set, we assume the developer is using the
+# Docker image mapped to localhost.  VPS deployments should explicitly
+# set REDIS_HOST/REDIS_PORT in their environment.
+def ensure_redis_container():
+    """Make sure a Redis container named `local-redis` is running.
+
+    - if container doesn't exist, create it with port mapping
+    - if container exists but is stopped, start it
+    - if container is already running, do nothing
+
+    This lets developers simply run `python main.py` and have the
+    dockerized Redis come up automatically.
+    """
+    import subprocess
+
+    name = "local-redis"
+    # check for running container
+    try:
+        result = subprocess.run(
+            ["docker", "ps", "-q", "-f", f"name={name}"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        running_id = result.stdout.strip()
+    except Exception as e:
+        print(f"⚠️  Unable to query Docker daemon: {e}")
+        return
+
+    if running_id:
+        # already running
+        return
+
+    # not running; check if there is a stopped container with that name
+    try:
+        result = subprocess.run(
+            ["docker", "ps", "-aq", "-f", f"name={name}"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        existing_id = result.stdout.strip()
+    except Exception as e:
+        print(f"⚠️  Unable to query Docker daemon: {e}")
+        return
+
+    if existing_id:
+        # start existing container
+        print("⚙️  Starting existing Redis container...")
+        subprocess.run(["docker", "start", name])
+    else:
+        # create a new one
+        print("⚙️  Creating new Redis container for local testing...")
+        subprocess.run([
+            "docker",
+            "run",
+            "-d",
+            "--name",
+            name,
+            "-p",
+            "6379:6379",
+            "redis:latest",
+        ])
+
+if platform.system() == "Windows" and not os.getenv('REDIS_HOST'):
+    os.environ['REDIS_HOST'] = 'localhost'
+    # port already defaults to 6379 elsewhere but set for clarity
+    os.environ['REDIS_PORT'] = os.getenv('REDIS_PORT', '6379')
+    print("⚙️  Detected Windows local environment; configuring Redis host to localhost:6379")
+
 from cache_db import get_cache_entry, get_batch_cache_entries, get_precision_batch_cache_entries, get_all_leagues
 from redis_cache import get_cache_stats, clear_all_cache, invalidate_cache
 import uuid
@@ -31,11 +108,18 @@ load_dotenv()
 security = HTTPBearer()
 
 # Load API keys from environment variables (NEVER hardcode in production!)
-# Admin key (full access to all endpoints)
-ADMIN_KEY = os.getenv('ADMIN_API_TOKEN', None)
+# Admin key (full access to all endpoints). older .env files may use
+# "ADMIN_TOKEN", so fall back to that if the preferred name isn't set.
+admin_key = os.getenv('ADMIN_API_TOKEN') or os.getenv('ADMIN_TOKEN')
+if admin_key:
+    admin_key = admin_key.strip()
+ADMIN_KEY = admin_key
 
 # Non-admin key (read-only access to cache endpoints)
-NON_ADMIN_KEY = os.getenv('API_TOKEN', None)
+user_key = os.getenv('API_TOKEN')
+if user_key:
+    user_key = user_key.strip()
+NON_ADMIN_KEY = user_key
 
 # All valid tokens (admin + non-admin)
 VALID_API_TOKENS = {token for token in [ADMIN_KEY, NON_ADMIN_KEY] if token}
@@ -141,6 +225,13 @@ app = FastAPI(
     redoc_url=None,
     openapi_url=None
 )
+
+# On startup, ensure dockerized Redis is running when we're in a local
+# Windows environment and no explicit REDIS_HOST has been provided.
+@app.on_event("startup")
+async def startup_containers():
+    if platform.system() == "Windows" and not os.getenv('REDIS_HOST'):
+        ensure_redis_container()
 
 # Mount static files for dashboard
 app.mount("/admin/js", StaticFiles(directory="js"), name="admin_js")

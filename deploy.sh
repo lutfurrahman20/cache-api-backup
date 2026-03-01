@@ -1,7 +1,9 @@
 #!/bin/bash
 
 # VPS Deployment Script for Cache API
-# This script automates the deployment process on the VPS
+# This script automates deployment on a VPS.
+# It is hardened for shared VPS usage by requiring project-specific
+# service/directory naming to avoid collisions with other deployments.
 
 set -e  # Exit on error
 
@@ -10,12 +12,17 @@ echo "Cache API VPS Deployment Script"
 echo "=========================================="
 echo ""
 
-# Configuration
-SERVICE_NAME="cache-api"
-SERVICE_DIR="/home/ubuntu/services/cache-api"
+# Configuration (override via env vars in CI or shell)
+SERVICE_NAME="${SERVICE_NAME:-cache-api}"
+SERVICE_DIR="${SERVICE_DIR:-/home/ubuntu/services/cache-api}"
 VENV_DIR="$SERVICE_DIR/venv"
-SERVICE_FILE="cache-api.service"
-REPO_URL="https://github.com/joypciu/cache-api.git"
+SERVICE_FILE="${SERVICE_FILE:-cache-api.service}"
+REPO_URL="${REPO_URL:-https://github.com/joypciu/cache-api.git}"
+DEPLOY_BRANCH="${DEPLOY_BRANCH:-main}"
+API_PORT="${API_PORT:-5000}"
+EXPECTED_REPO_SLUG="${EXPECTED_REPO_SLUG:-joypciu/cache-api}"
+REQUIRE_UNIQUE_NAME="${REQUIRE_UNIQUE_NAME:-true}"
+LOCK_FILE="/tmp/${SERVICE_NAME}.deploy.lock"
 
 # Colors for output
 RED='\033[0;31m'
@@ -36,10 +43,36 @@ print_info() {
     echo -e "${YELLOW}→ $1${NC}"
 }
 
+# Lock to avoid parallel deploy races
+if [ -f "$LOCK_FILE" ]; then
+    print_error "Another deployment appears to be running for $SERVICE_NAME ($LOCK_FILE exists)"
+    exit 1
+fi
+trap 'rm -f "$LOCK_FILE"' EXIT
+touch "$LOCK_FILE"
+
 # Check if running as correct user
 if [ "$USER" != "ubuntu" ]; then
     print_error "This script should be run as the ubuntu user"
     exit 1
+fi
+
+print_info "Deploy target:"
+echo "  SERVICE_NAME=$SERVICE_NAME"
+echo "  SERVICE_DIR=$SERVICE_DIR"
+echo "  DEPLOY_BRANCH=$DEPLOY_BRANCH"
+echo "  API_PORT=$API_PORT"
+echo "  REPO_URL=$REPO_URL"
+
+if [ "$REQUIRE_UNIQUE_NAME" = "true" ] && [ "$SERVICE_NAME" = "cache-api" ]; then
+    print_error "SERVICE_NAME=cache-api is not unique for shared VPS use."
+    print_info "Set a unique SERVICE_NAME (example: cache-api-prod-joy) and matching SERVICE_DIR."
+    exit 1
+fi
+
+# Guard against reusing an existing systemd unit unintentionally.
+if systemctl list-unit-files | grep -q "^${SERVICE_NAME}.service"; then
+    print_info "Systemd unit ${SERVICE_NAME}.service already exists (will be updated)"
 fi
 
 # Check if Redis is installed
@@ -70,7 +103,7 @@ fi
 if [ ! -d "$SERVICE_DIR" ]; then
     print_info "Creating service directory..."
     sudo mkdir -p "$SERVICE_DIR"
-    sudo chown -R ubuntu:ubuntu /home/ubuntu/services
+    sudo chown -R ubuntu:ubuntu "$(dirname "$SERVICE_DIR")"
     print_success "Service directory created"
 fi
 
@@ -84,8 +117,16 @@ if [ ! -d ".git" ]; then
     print_success "Repository cloned"
 else
     print_info "Updating repository..."
-    git fetch origin
-    git reset --hard origin/main
+    current_remote="$(git remote get-url origin 2>/dev/null || true)"
+    if [ -n "$current_remote" ] && [[ "$current_remote" != *"$EXPECTED_REPO_SLUG"* ]]; then
+        print_error "Repo mismatch in $SERVICE_DIR"
+        echo "  expected remote containing: $EXPECTED_REPO_SLUG"
+        echo "  actual remote: $current_remote"
+        exit 1
+    fi
+    git fetch origin "$DEPLOY_BRANCH"
+    git checkout -f "$DEPLOY_BRANCH"
+    git reset --hard "origin/$DEPLOY_BRANCH"
     print_success "Repository updated"
 fi
 
@@ -119,13 +160,33 @@ fi
 
 # Install systemd service
 print_info "Installing systemd service..."
-sudo cp "$SERVICE_FILE" "/etc/systemd/system/$SERVICE_FILE"
+if [ -f "$SERVICE_FILE" ]; then
+    # If the service file exists in repo, install it under SERVICE_NAME
+    sudo cp "$SERVICE_FILE" "/etc/systemd/system/${SERVICE_NAME}.service"
+else
+    print_info "Service file not found in repo; creating generated unit ${SERVICE_NAME}.service"
+    cat > "/tmp/${SERVICE_NAME}.service" <<EOF
+[Unit]
+Description=${SERVICE_NAME}
+After=network.target redis-server.service
+Wants=redis-server.service
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=${SERVICE_DIR}
+Environment=PYTHONUNBUFFERED=1
+ExecStart=${VENV_DIR}/bin/python -m uvicorn main:app --host 0.0.0.0 --port ${API_PORT}
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    sudo cp "/tmp/${SERVICE_NAME}.service" "/etc/systemd/system/${SERVICE_NAME}.service"
+fi
 sudo systemctl daemon-reload
 print_success "Systemd service installed"
-
-# Kill any existing process on port 5000
-print_info "Checking for existing process on port 5000..."
-sudo fuser -k 5000/tcp 2>/dev/null || true
 
 # Enable and restart service
 print_info "Starting $SERVICE_NAME service..."
@@ -147,8 +208,8 @@ fi
 
 # Verify API is responding
 print_info "Verifying API is responding..."
-if curl -f http://localhost:5000/health &> /dev/null; then
-    print_success "API is responding on port 8001"
+if curl -fsS "http://localhost:${API_PORT}/" &> /dev/null; then
+    print_success "API is responding on port ${API_PORT}"
 else
     print_error "API is not responding"
 fi
@@ -173,14 +234,18 @@ sudo systemctl status redis-server --no-pager | head -n 5
 echo ""
 
 # Port status
-print_info "Port 8001 Status:"
-sudo netstat -tlnp | grep :8001 || echo "Port not listening"
+print_info "Port ${API_PORT} Status:"
+sudo netstat -tlnp | grep ":${API_PORT}" || echo "Port not listening"
 
 echo ""
 
 # Cache statistics
 print_info "Cache Statistics:"
-curl -s http://localhost:8001/cache/stats | python3 -m json.tool 2>/dev/null || echo "Could not fetch cache stats"
+if [ -n "${ADMIN_TOKEN:-}" ]; then
+    curl -s -H "Authorization: Bearer ${ADMIN_TOKEN}" "http://localhost:${API_PORT}/cache/stats" | python3 -m json.tool 2>/dev/null || echo "Could not fetch cache stats"
+else
+    echo "ADMIN_TOKEN not set; skipping /cache/stats check"
+fi
 
 echo ""
 echo "=========================================="
@@ -191,5 +256,5 @@ print_info "Useful commands:"
 echo "  View logs:         sudo journalctl -u $SERVICE_NAME -f"
 echo "  Restart service:   sudo systemctl restart $SERVICE_NAME"
 echo "  Check status:      sudo systemctl status $SERVICE_NAME"
-echo "  Clear cache:       curl -X DELETE http://localhost:8001/cache/clear"
+echo "  Clear cache:       curl -X DELETE http://localhost:${API_PORT}/cache/clear"
 echo ""

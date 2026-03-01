@@ -85,9 +85,8 @@ logs/
 # Ignore SQLite files except the main database
 *.sqlite
 *.sqlite3
-*.db
 # Allow sports_data.db to be tracked
-!sports_data.db
+
 
 # ignore test files
 test_*.py
@@ -101,6 +100,10 @@ request_logs/
 *.db-shm
 *.db-wal
 uuid_tracking.db
+request_logs/*.db
+request_logs/*.sqlite
+request_logs/*.sqlite3
+*.db-journal
 
 
 # ignore md files
@@ -117,3 +120,7 @@ verify_*.py
 verify_*.ipynb
 verify*.ipynb
 verify_failures_production.py
+
+# ignore old readme md
+README_old.md
+README copy.md

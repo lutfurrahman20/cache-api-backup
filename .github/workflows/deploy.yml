@@ -9,6 +9,13 @@ on:
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    env:
+      DEPLOY_SERVICE_NAME: ${{ secrets.DEPLOY_SERVICE_NAME }}
+      DEPLOY_DIR: ${{ secrets.DEPLOY_DIR }}
+      DEPLOY_BRANCH: ${{ secrets.DEPLOY_BRANCH }}
+      DEPLOY_PORT: ${{ secrets.DEPLOY_PORT }}
+      DEPLOY_REPO_URL: ${{ secrets.DEPLOY_REPO_URL }}
+      DEPLOY_REPO_SLUG: ${{ secrets.DEPLOY_REPO_SLUG }}
 
     steps:
       - name: Checkout code
@@ -21,69 +28,38 @@ jobs:
           username: ${{ secrets.VPS_USERNAME }}
           key: ${{ secrets.VPS_SSH_KEY }}
           port: ${{ secrets.VPS_PORT }}
-          command_timeout: 2m
+          command_timeout: 5m
           script: |
-            # Navigate to service directory
-            cd /home/ubuntu/services/cache-api
+            set -e
+            SERVICE_NAME="${DEPLOY_SERVICE_NAME:-cache-api-prod}"
+            SERVICE_DIR="${DEPLOY_DIR:-/home/ubuntu/services/${SERVICE_NAME}}"
+            BRANCH="${DEPLOY_BRANCH:-main}"
+            PORT="${DEPLOY_PORT:-5000}"
+            REPO_URL="${DEPLOY_REPO_URL:-https://github.com/joypciu/cache-api.git}"
+            REPO_SLUG="${DEPLOY_REPO_SLUG:-joypciu/cache-api}"
 
-            # Pull latest changes from git
-            git fetch origin
-            git reset --hard origin/main
+            echo "Deploying service=${SERVICE_NAME} dir=${SERVICE_DIR} branch=${BRANCH} port=${PORT}"
 
-            # Install Redis if not already installed
-            if ! command -v redis-server &> /dev/null; then
-              echo "Installing Redis..."
-              sudo apt update
-              sudo apt install redis-server -y
+            if [ ! -d "${SERVICE_DIR}" ]; then
+              mkdir -p "${SERVICE_DIR}"
+            fi
+            cd "${SERVICE_DIR}"
+
+            if [ ! -d ".git" ]; then
+              git clone "${REPO_URL}" .
             fi
 
-            # Configure Redis to start on boot
-            sudo systemctl enable redis-server
+            export SERVICE_NAME="${SERVICE_NAME}"
+            export SERVICE_DIR="${SERVICE_DIR}"
+            export DEPLOY_BRANCH="${BRANCH}"
+            export API_PORT="${PORT}"
+            export REPO_URL="${REPO_URL}"
+            export EXPECTED_REPO_SLUG="${REPO_SLUG}"
+            export REQUIRE_UNIQUE_NAME="true"
 
-            # Check if Redis is running, start if not
-            if ! sudo systemctl is-active --quiet redis-server; then
-              echo "Starting Redis server..."
-              sudo systemctl start redis-server
-            fi
+            chmod +x deploy.sh
+            ./deploy.sh
 
-            # Verify Redis is working
-            redis-cli ping || echo "Warning: Redis not responding"
-
-            # Create or update .env file if it doesn't exist
-            if [ ! -f .env ]; then
-              echo "Creating .env file from .env.example..."
-              cp .env.example .env
-            fi
-
-            # Activate virtual environment and install/update dependencies
-            source venv/bin/activate
-            pip install -r requirements.txt --upgrade
-
-            # Copy updated service file
-            sudo cp cache-api.service /etc/systemd/system/cache-api.service
-            sudo systemctl daemon-reload
-
-            # Kill any process on port 8001
-            sudo fuser -k 8001/tcp || true
-
-            # Restart the cache-api service
-            sudo systemctl restart cache-api
-            sudo systemctl enable cache-api
-
-            # Wait and check status
-            sleep 3
-            sudo systemctl status cache-api --no-pager || true
-
-            # Check Redis status
-            echo "=== Redis status ==="
-            sudo systemctl status redis-server --no-pager || true
-
-            # Check if port 8001 is listening
-            echo "=== Port 8001 status ==="
-            sudo netstat -tlnp | grep :8001 || echo "Port 8001 not listening"
-
-            # Show recent logs
-            echo "=== Cache API logs ==="
-            sudo journalctl -u cache-api -n 30 --no-pager || true
-
-            echo "✅ Cache API deployment completed successfully"
+            echo "=== service status ==="
+            sudo systemctl status "${SERVICE_NAME}" --no-pager || true
+            echo "✅ deployment completed"
