@@ -75,18 +75,12 @@ def get_geo_location(ip_address: str) -> Dict[str, Any]:
         }
     
     try:
-        # Prefer HTTPS. Fall back to HTTP only if HTTPS call fails.
+        # HTTPS-only request for transport security.
         # ip-api.com free tier limit: 45 requests/minute.
-        try:
-            response = requests.get(
-                f"https://ip-api.com/json/{ip_address}",
-                timeout=5
-            )
-        except Exception:
-            response = requests.get(
-                f"http://ip-api.com/json/{ip_address}",
-                timeout=5
-            )
+        response = requests.get(
+            f"https://ip-api.com/json/{ip_address}",
+            timeout=5
+        )
         
         if response.status_code == 200:
             data = response.json()

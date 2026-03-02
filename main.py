@@ -163,7 +163,7 @@ async def verify_rate_limit(request: Request):
     Raises:
         HTTPException: If rate limit is exceeded
     """
-    client_ip = request.client.host
+    client_ip = request.client.host if request.client else "unknown"
     
     if not check_rate_limit(client_ip):
         raise HTTPException(
@@ -255,7 +255,7 @@ async def track_request_middleware(request: Request, call_next):
     
     try:
         # Extract IP
-        ip_address = request.client.host
+        ip_address = request.client.host if request.client else "unknown"
         user_agent = request.headers.get("user-agent", "unknown")
         
         # Extract Token
@@ -633,7 +633,8 @@ async def get_precision_batch_cache(
     }
     """
     try:
-        result = await run_in_threadpool(get_precision_batch_cache_entries, request_body.queries)
+        query_dicts = [query.model_dump(exclude_none=True) for query in request_body.queries]
+        result = await run_in_threadpool(get_precision_batch_cache_entries, query_dicts)
         
         return JSONResponse(
             status_code=200,
@@ -754,7 +755,8 @@ async def custom_openapi(admin_access: Optional[str] = Cookie(None)):
         filtered_routes = []
         for route in app.routes:
             # Check if route is an APIRoute or similar and has tags
-            if hasattr(route, "tags") and route.tags and "admin" in route.tags:
+            route_tags = getattr(route, "tags", None)
+            if route_tags and "admin" in route_tags:
                 continue
             filtered_routes.append(route)
         
