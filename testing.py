@@ -675,7 +675,17 @@ def run_full_suite(
         results.append(run_case(env_name, base_url, "admin sessions", "GET", "/admin/sessions", {200}, token=admin_token))
         results.append(run_case(env_name, base_url, "admin logs", "GET", "/admin/logs", {200}, token=admin_token, params={"limit": 10, "offset": 0}))
         results.append(run_case(env_name, base_url, "admin cache stats", "GET", "/admin/stats/cache", {200}, token=admin_token))
-        results.append(run_case(env_name, base_url, "admin dashboard", "GET", "/admin/dashboard", {200}, token=admin_token))
+        results.append(
+            run_case(
+                env_name,
+                base_url,
+                "admin dashboard",
+                "GET",
+                "/admin/dashboard",
+                {200},
+                cookies={"admin_access": admin_token},
+            )
+        )
         results.append(
             run_case(
                 env_name,
