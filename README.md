@@ -184,6 +184,39 @@ This currently enables testing `DELETE /cache/clear`.
 - Final summary prints `total`, `passed`, `failed`
 - Exit code is `0` only when all checks pass; otherwise `1` (CI-friendly)
 
+### Coverage counts (full mode)
+
+Per target environment (`prod` or `local`), `--mode full` currently runs:
+
+- `45` checks when admin token is provided (non-destructive default)
+- `46` checks with `--include-destructive` (adds `DELETE /cache/clear`)
+- `37` checks when admin token is not provided (admin block skipped)
+
+Distinct endpoints covered in full mode:
+
+- `14` endpoints by default
+- `15` endpoints when destructive check is enabled
+
+Endpoint list covered:
+
+- `/`, `/docs`, `/openapi.json`
+- `/cache`, `/cache/batch`, `/cache/batch/precision`, `/leagues`
+- `/health`, `/cache/stats`, `/cache/invalidate`
+- `/admin/dashboard`, `/admin/logs`, `/admin/sessions`, `/admin/stats/cache`
+- optional: `/cache/clear`
+
+### Filter/combination coverage
+
+Current suite includes the following parameter/body combination coverage:
+
+- `GET /cache`: `15` query combinations
+  - includes valid and validation-error cases (`team` without `sport`, `league` without `sport`)
+- `POST /cache/batch`: `5` body combinations
+  - includes mixed and sparse payloads across team/player/market/league/sport
+- `POST /cache/batch/precision`: `3` precision query-set combinations
+- `GET /leagues`: `8` filter combinations
+  - all combinations of `{sport, search, region}` plus empty filter
+
 ## Deployment flow (GitHub Actions + VPS)
 
 Push to `main` triggers `.github/workflows/deploy.yml`, which:
