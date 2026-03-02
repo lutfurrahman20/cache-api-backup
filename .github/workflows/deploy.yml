@@ -16,6 +16,7 @@ jobs:
       DEPLOY_PORT: ${{ secrets.DEPLOY_PORT }}
       DEPLOY_REPO_URL: ${{ secrets.DEPLOY_REPO_URL }}
       DEPLOY_REPO_SLUG: ${{ secrets.DEPLOY_REPO_SLUG }}
+      DEPLOY_PREVIOUS_SERVICE_NAME: ${{ secrets.DEPLOY_PREVIOUS_SERVICE_NAME }}
 
     steps:
       - name: Checkout code
@@ -31,12 +32,22 @@ jobs:
           command_timeout: 5m
           script: |
             set -e
-            SERVICE_NAME="${DEPLOY_SERVICE_NAME:-cache-api-prod}"
+            RAW_SERVICE_NAME="${DEPLOY_SERVICE_NAME:-cache-api}"
+            if [ "${RAW_SERVICE_NAME}" = "cache-api-prod" ]; then
+              SERVICE_NAME="cache-api"
+            else
+              SERVICE_NAME="${RAW_SERVICE_NAME}"
+            fi
             SERVICE_DIR="${DEPLOY_DIR:-/home/ubuntu/services/${SERVICE_NAME}}"
             BRANCH="${DEPLOY_BRANCH:-main}"
             PORT="${DEPLOY_PORT:-5000}"
             REPO_URL="${DEPLOY_REPO_URL:-https://github.com/joypciu/cache-api.git}"
             REPO_SLUG="${DEPLOY_REPO_SLUG:-joypciu/cache-api}"
+            PREVIOUS_SERVICE="${DEPLOY_PREVIOUS_SERVICE_NAME:-}"
+
+            if [ -z "${PREVIOUS_SERVICE}" ] && [ "${SERVICE_NAME}" = "cache-api" ]; then
+              PREVIOUS_SERVICE="cache-api-prod"
+            fi
 
             echo "Deploying service=${SERVICE_NAME} dir=${SERVICE_DIR} branch=${BRANCH} port=${PORT}"
 
@@ -55,7 +66,8 @@ jobs:
             export API_PORT="${PORT}"
             export REPO_URL="${REPO_URL}"
             export EXPECTED_REPO_SLUG="${REPO_SLUG}"
-            export REQUIRE_UNIQUE_NAME="true"
+            export PREVIOUS_SERVICE_NAME="${PREVIOUS_SERVICE}"
+            export REQUIRE_UNIQUE_NAME="false"
 
             chmod +x deploy.sh
             ./deploy.sh

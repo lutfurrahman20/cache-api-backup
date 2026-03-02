@@ -21,8 +21,13 @@ REPO_URL="${REPO_URL:-https://github.com/joypciu/cache-api.git}"
 DEPLOY_BRANCH="${DEPLOY_BRANCH:-main}"
 API_PORT="${API_PORT:-5000}"
 EXPECTED_REPO_SLUG="${EXPECTED_REPO_SLUG:-joypciu/cache-api}"
+PREVIOUS_SERVICE_NAME="${PREVIOUS_SERVICE_NAME:-}"
 REQUIRE_UNIQUE_NAME="${REQUIRE_UNIQUE_NAME:-true}"
 LOCK_FILE="/tmp/${SERVICE_NAME}.deploy.lock"
+
+if [ -z "$PREVIOUS_SERVICE_NAME" ] && [[ "$SERVICE_NAME" == *-prod ]]; then
+    PREVIOUS_SERVICE_NAME="${SERVICE_NAME%-prod}"
+fi
 
 # Colors for output
 RED='\033[0;31m'
@@ -63,6 +68,7 @@ echo "  SERVICE_DIR=$SERVICE_DIR"
 echo "  DEPLOY_BRANCH=$DEPLOY_BRANCH"
 echo "  API_PORT=$API_PORT"
 echo "  REPO_URL=$REPO_URL"
+echo "  PREVIOUS_SERVICE_NAME=${PREVIOUS_SERVICE_NAME:-<none>}"
 
 if [ "$REQUIRE_UNIQUE_NAME" = "true" ] && [ "$SERVICE_NAME" = "cache-api" ]; then
     print_error "SERVICE_NAME=cache-api is not unique for shared VPS use."
@@ -192,12 +198,40 @@ print_success "Systemd service installed"
 print_info "Starting $SERVICE_NAME service..."
 sudo systemctl stop "$SERVICE_NAME" 2>/dev/null || true
 
-# Fail fast if another process is occupying API_PORT.
+# If another process occupies API_PORT, attempt safe takeover from legacy service.
+port_line="$(sudo ss -ltnp "sport = :${API_PORT}" 2>/dev/null | awk 'NR>1 && /LISTEN/{print; exit}')"
+if [ -n "$port_line" ]; then
+    port_pid="$(echo "$port_line" | sed -n 's/.*pid=\([0-9]\+\).*/\1/p')"
+    owner_unit=""
+
+    if [ -n "$port_pid" ] && [ -r "/proc/${port_pid}/cgroup" ]; then
+        owner_unit="$(grep -oE '[^/]+\.service' "/proc/${port_pid}/cgroup" | head -n 1 || true)"
+    fi
+
+    print_info "Port ${API_PORT} currently in use: ${port_line}"
+
+    if [ "$owner_unit" = "${SERVICE_NAME}.service" ]; then
+        print_info "Port is still owned by ${SERVICE_NAME}.service; waiting for release..."
+        sleep 2
+    elif [ -n "$PREVIOUS_SERVICE_NAME" ] && [ "$owner_unit" = "${PREVIOUS_SERVICE_NAME}.service" ]; then
+        print_info "Port is owned by legacy unit ${PREVIOUS_SERVICE_NAME}.service; stopping it for takeover..."
+        sudo systemctl stop "$PREVIOUS_SERVICE_NAME"
+        sleep 2
+    else
+        print_error "Port ${API_PORT} is occupied by an unrelated process/unit; refusing to kill it."
+        if [ -n "$owner_unit" ]; then
+            print_info "Detected owner unit: ${owner_unit}"
+        fi
+        print_info "Use a different DEPLOY_PORT or set PREVIOUS_SERVICE_NAME to allow controlled takeover."
+        exit 1
+    fi
+fi
+
+# Final hard check before start.
 if sudo ss -ltnp | grep -q ":${API_PORT} "; then
-    print_error "Port ${API_PORT} is already in use by another process."
+    print_error "Port ${API_PORT} is still in use after takeover attempt."
     print_info "Port owner details:"
     sudo ss -ltnp | grep ":${API_PORT} " || true
-    print_info "Use a different DEPLOY_PORT or free this port before deploy."
     exit 1
 fi
 
