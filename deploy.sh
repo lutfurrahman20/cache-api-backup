@@ -16,7 +16,7 @@ echo ""
 SERVICE_NAME="${SERVICE_NAME:-cache-api}"
 SERVICE_DIR="${SERVICE_DIR:-/home/ubuntu/services/cache-api}"
 VENV_DIR="$SERVICE_DIR/venv"
-SERVICE_FILE="${SERVICE_FILE:-cache-api.service}"
+SERVICE_FILE="${SERVICE_FILE:-}"
 REPO_URL="${REPO_URL:-https://github.com/joypciu/cache-api.git}"
 DEPLOY_BRANCH="${DEPLOY_BRANCH:-main}"
 API_PORT="${API_PORT:-5000}"
@@ -166,10 +166,21 @@ fi
 
 # Install systemd service
 print_info "Installing systemd service..."
-if [ -f "$SERVICE_FILE" ]; then
-    # If the service file exists in repo, install it under SERVICE_NAME
-    sudo cp "$SERVICE_FILE" "/etc/systemd/system/${SERVICE_NAME}.service"
-else
+unit_installed_from_repo="false"
+if [ -n "$SERVICE_FILE" ]; then
+    if [ -f "$SERVICE_FILE" ]; then
+        print_info "Using service file from repo: $SERVICE_FILE"
+        if sudo cp "$SERVICE_FILE" "/etc/systemd/system/${SERVICE_NAME}.service"; then
+            unit_installed_from_repo="true"
+        else
+            print_info "Could not copy $SERVICE_FILE; falling back to generated unit"
+        fi
+    else
+        print_info "Requested service file not found: $SERVICE_FILE (will generate unit)"
+    fi
+fi
+
+if [ "$unit_installed_from_repo" != "true" ]; then
     print_info "Service file not found in repo; creating generated unit ${SERVICE_NAME}.service"
     cat > "/tmp/${SERVICE_NAME}.service" <<EOF
 [Unit]
