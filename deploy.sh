@@ -22,6 +22,13 @@ DEPLOY_BRANCH="${DEPLOY_BRANCH:-main}"
 API_PORT="${API_PORT:-5000}"
 EXPECTED_REPO_SLUG="${EXPECTED_REPO_SLUG:-joypciu/cache-api}"
 PREVIOUS_SERVICE_NAME="${PREVIOUS_SERVICE_NAME:-}"
+SOURCE_REPO_SLUG="${SOURCE_REPO_SLUG:-unknown}"
+PRIMARY_REPO_SLUG="${PRIMARY_REPO_SLUG:-joypciu/cache-api}"
+ALLOW_PRIMARY_SERVICE_NAME="${ALLOW_PRIMARY_SERVICE_NAME:-false}"
+PRODUCTION_SERVICE_NAME="${PRODUCTION_SERVICE_NAME:-cache-api}"
+PRODUCTION_PORT="${PRODUCTION_PORT:-5000}"
+NGINX_SITE_NAME="${NGINX_SITE_NAME:-${SERVICE_NAME}}"
+PROTECTED_NGINX_SITE_NAME="${PROTECTED_NGINX_SITE_NAME:-cache-api}"
 REQUIRE_UNIQUE_NAME="${REQUIRE_UNIQUE_NAME:-true}"
 LOCK_FILE="/tmp/${SERVICE_NAME}.deploy.lock"
 
@@ -69,11 +76,44 @@ echo "  DEPLOY_BRANCH=$DEPLOY_BRANCH"
 echo "  API_PORT=$API_PORT"
 echo "  REPO_URL=$REPO_URL"
 echo "  PREVIOUS_SERVICE_NAME=${PREVIOUS_SERVICE_NAME:-<none>}"
+echo "  SOURCE_REPO_SLUG=$SOURCE_REPO_SLUG"
+echo "  PRIMARY_REPO_SLUG=$PRIMARY_REPO_SLUG"
+echo "  NGINX_SITE_NAME=$NGINX_SITE_NAME"
 
 if [ "$REQUIRE_UNIQUE_NAME" = "true" ] && [ "$SERVICE_NAME" = "cache-api" ]; then
     print_error "SERVICE_NAME=cache-api is not unique for shared VPS use."
     print_info "Set a unique SERVICE_NAME (example: cache-api-prod-joy) and matching SERVICE_DIR."
     exit 1
+fi
+
+if [ "$SERVICE_NAME" = "$PRODUCTION_SERVICE_NAME" ]; then
+    if [ "$ALLOW_PRIMARY_SERVICE_NAME" != "true" ] || [ "$SOURCE_REPO_SLUG" != "$PRIMARY_REPO_SLUG" ]; then
+        print_error "Protected service name ${PRODUCTION_SERVICE_NAME} is reserved for the primary repository only."
+        print_info "source repo: $SOURCE_REPO_SLUG"
+        print_info "primary repo: $PRIMARY_REPO_SLUG"
+        print_info "For forks, use unique DEPLOY_SERVICE_NAME, DEPLOY_DIR, and DEPLOY_PORT."
+        exit 1
+    fi
+fi
+
+if [ "$ALLOW_PRIMARY_SERVICE_NAME" != "true" ] || [ "$SOURCE_REPO_SLUG" != "$PRIMARY_REPO_SLUG" ]; then
+    if [ "$API_PORT" = "$PRODUCTION_PORT" ]; then
+        print_error "Protected production port ${PRODUCTION_PORT} is reserved for the primary repository only."
+        print_info "For forks, set a unique DEPLOY_PORT."
+        exit 1
+    fi
+
+    if [ "$NGINX_SITE_NAME" = "$PROTECTED_NGINX_SITE_NAME" ]; then
+        print_error "Protected nginx site ${PROTECTED_NGINX_SITE_NAME} is reserved for the primary repository only."
+        print_info "For forks, set a unique DEPLOY_NGINX_SITE_NAME."
+        exit 1
+    fi
+
+    if sudo test -e "/etc/nginx/sites-enabled/${NGINX_SITE_NAME}" || sudo test -e "/etc/nginx/sites-available/${NGINX_SITE_NAME}"; then
+        print_error "Nginx site name ${NGINX_SITE_NAME} already exists on VPS."
+        print_info "Use a unique DEPLOY_NGINX_SITE_NAME for fork deployments."
+        exit 1
+    fi
 fi
 
 # Guard against reusing an existing systemd unit unintentionally.

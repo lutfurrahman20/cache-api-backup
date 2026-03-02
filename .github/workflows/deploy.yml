@@ -17,6 +17,11 @@ jobs:
       DEPLOY_REPO_URL: ${{ secrets.DEPLOY_REPO_URL }}
       DEPLOY_REPO_SLUG: ${{ secrets.DEPLOY_REPO_SLUG }}
       DEPLOY_PREVIOUS_SERVICE_NAME: ${{ secrets.DEPLOY_PREVIOUS_SERVICE_NAME }}
+      DEPLOY_PRIMARY_REPO_SLUG: ${{ secrets.DEPLOY_PRIMARY_REPO_SLUG }}
+      DEPLOY_PRODUCTION_SERVICE_NAME: ${{ secrets.DEPLOY_PRODUCTION_SERVICE_NAME }}
+      DEPLOY_PRODUCTION_PORT: ${{ secrets.DEPLOY_PRODUCTION_PORT }}
+      DEPLOY_NGINX_SITE_NAME: ${{ secrets.DEPLOY_NGINX_SITE_NAME }}
+      DEPLOY_PROTECTED_NGINX_SITE_NAME: ${{ secrets.DEPLOY_PROTECTED_NGINX_SITE_NAME }}
 
     steps:
       - name: Checkout code
@@ -43,7 +48,18 @@ jobs:
             PORT="${DEPLOY_PORT:-5000}"
             REPO_URL="${DEPLOY_REPO_URL:-https://github.com/joypciu/cache-api.git}"
             REPO_SLUG="${DEPLOY_REPO_SLUG:-joypciu/cache-api}"
+            PRIMARY_REPO_SLUG="${DEPLOY_PRIMARY_REPO_SLUG:-joypciu/cache-api}"
+            PRODUCTION_SERVICE_NAME="${DEPLOY_PRODUCTION_SERVICE_NAME:-cache-api}"
+            PRODUCTION_PORT="${DEPLOY_PRODUCTION_PORT:-5000}"
+            NGINX_SITE_NAME="${DEPLOY_NGINX_SITE_NAME:-${SERVICE_NAME}}"
+            PROTECTED_NGINX_SITE_NAME="${DEPLOY_PROTECTED_NGINX_SITE_NAME:-cache-api}"
+            SOURCE_REPO_SLUG="${GITHUB_REPOSITORY}"
             PREVIOUS_SERVICE="${DEPLOY_PREVIOUS_SERVICE_NAME:-}"
+            ALLOW_PRIMARY_SERVICE_NAME="false"
+
+            if [ "${SERVICE_NAME}" = "cache-api" ] && [ "${SOURCE_REPO_SLUG}" = "${PRIMARY_REPO_SLUG}" ]; then
+              ALLOW_PRIMARY_SERVICE_NAME="true"
+            fi
 
             if [ -z "${PREVIOUS_SERVICE}" ] && [ "${SERVICE_NAME}" = "cache-api" ]; then
               PREVIOUS_SERVICE="cache-api-prod"
@@ -67,6 +83,13 @@ jobs:
             export REPO_URL="${REPO_URL}"
             export EXPECTED_REPO_SLUG="${REPO_SLUG}"
             export PREVIOUS_SERVICE_NAME="${PREVIOUS_SERVICE}"
+            export SOURCE_REPO_SLUG="${SOURCE_REPO_SLUG}"
+            export PRIMARY_REPO_SLUG="${PRIMARY_REPO_SLUG}"
+            export ALLOW_PRIMARY_SERVICE_NAME="${ALLOW_PRIMARY_SERVICE_NAME}"
+            export PRODUCTION_SERVICE_NAME="${PRODUCTION_SERVICE_NAME}"
+            export PRODUCTION_PORT="${PRODUCTION_PORT}"
+            export NGINX_SITE_NAME="${NGINX_SITE_NAME}"
+            export PROTECTED_NGINX_SITE_NAME="${PROTECTED_NGINX_SITE_NAME}"
             export REQUIRE_UNIQUE_NAME="false"
 
             chmod +x deploy.sh
