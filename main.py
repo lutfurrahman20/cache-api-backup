@@ -28,66 +28,76 @@ load_dotenv()
 # REDIS_HOST hasn't been set, we assume the developer is using the
 # Docker image mapped to localhost.  VPS deployments should explicitly
 # set REDIS_HOST/REDIS_PORT in their environment.
-def ensure_redis_container():
-    """Make sure a Redis container named `local-redis` is running.
+def _find_redis_container(running_only: bool) -> str:
+    """
+    Return the name of the first Docker container that looks like Redis.
 
-    - if container doesn't exist, create it with port mapping
-    - if container exists but is stopped, start it
-    - if container is already running, do nothing
+    Matches any container whose name OR image contains 'redis'
+    (case-insensitive), covering names like: redis, local-redis,
+    redis-local, my-redis, redis-stack, etc.
 
-    This lets developers simply run `python main.py` and have the
-    dockerized Redis come up automatically.
+    Args:
+        running_only: if True only inspect running containers (docker ps),
+                      otherwise include stopped ones (docker ps -a).
     """
     import subprocess
 
-    name = "local-redis"
-    # check for running container
+    flags = ["docker", "ps", "--format", "{{.Names}}\t{{.Image}}"]
+    if not running_only:
+        flags.insert(2, "-a")
+
     try:
-        result = subprocess.run(
-            ["docker", "ps", "-q", "-f", f"name={name}"],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        running_id = result.stdout.strip()
-    except Exception as e:
-        print(f"⚠️  Unable to query Docker daemon: {e}")
+        result = subprocess.run(flags, capture_output=True, text=True, check=True)
+    except Exception:
+        return ""
+
+    for line in result.stdout.splitlines():
+        parts = line.split("\t", 1)
+        if len(parts) != 2:
+            continue
+        cname, image = parts
+        if "redis" in cname.lower() or "redis" in image.lower():
+            return cname.strip()
+
+    return ""
+
+
+def ensure_redis_container():
+    """Make sure a Redis container is running locally.
+
+    Discovery order (name OR image must contain 'redis'):
+      1. Any currently-running container  → do nothing, use it
+      2. Any stopped container            → start it
+      3. No container found at all        → create 'local-redis'
+
+    Covers all naming conventions: redis, local-redis, redis-local,
+    redis-stack, my-redis, etc., so the app works across different
+    developer machines without config changes.
+    """
+    import subprocess
+
+    # 1. Already running?
+    running_name = _find_redis_container(running_only=True)
+    if running_name:
+        print(f"⚙️  Redis container already running: {running_name}")
         return
 
-    if running_id:
-        # already running
+    # 2. Stopped container?
+    stopped_name = _find_redis_container(running_only=False)
+    if stopped_name:
+        print(f"⚙️  Starting existing Redis container: {stopped_name}")
+        subprocess.run(["docker", "start", stopped_name])
         return
 
-    # not running; check if there is a stopped container with that name
-    try:
-        result = subprocess.run(
-            ["docker", "ps", "-aq", "-f", f"name={name}"],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        existing_id = result.stdout.strip()
-    except Exception as e:
-        print(f"⚠️  Unable to query Docker daemon: {e}")
-        return
-
-    if existing_id:
-        # start existing container
-        print("⚙️  Starting existing Redis container...")
-        subprocess.run(["docker", "start", name])
-    else:
-        # create a new one
-        print("⚙️  Creating new Redis container for local testing...")
-        subprocess.run([
-            "docker",
-            "run",
-            "-d",
-            "--name",
-            name,
-            "-p",
-            "6379:6379",
-            "redis:latest",
-        ])
+    # 3. Nothing found – create a fresh one
+    fallback_name = "local-redis"
+    print(f"⚙️  No Redis container found. Creating '{fallback_name}'...")
+    subprocess.run([
+        "docker", "run", "-d",
+        "--name", fallback_name,
+        "-p", "6379:6379",
+        "redis:latest",
+    ])
 
 if platform.system() == "Windows" and not os.getenv('REDIS_HOST'):
     os.environ['REDIS_HOST'] = 'localhost'

@@ -11,7 +11,7 @@ import requests
 
 
 PROD_BASE = "https://cache-api.eternitylabs.co"
-LOCAL_BASE = "http://localhost:5000"
+LOCAL_BASE = "http://127.0.0.1:5000"
 TIMEOUT = 20
 
 
