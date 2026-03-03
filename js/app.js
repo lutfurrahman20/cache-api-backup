@@ -4,7 +4,9 @@
 
 // Configuration
 const CONFIG = {
-    apiBaseUrl: 'https://cache-api.eternitylabs.co',
+    // Use the current page's origin so the dashboard works both locally
+    // (http://localhost:5000) and in production without hardcoding a URL.
+    apiBaseUrl: window.location.origin,
     checkInterval: 30000 // 30 seconds
 };
 
