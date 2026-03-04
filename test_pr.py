@@ -423,13 +423,15 @@ class TestAdminInfoEndpoints:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestAdminDashboard:
-    def test_dashboard_no_cookie_returns_401(self):
+    def test_dashboard_no_cookie_still_returns_200(self):
+        """Dashboard is always served; JS handles auth so no cookie needed."""
         r = CLIENT.get("/admin/dashboard")
-        assert r.status_code == 401
+        assert r.status_code == 200
 
-    def test_dashboard_wrong_cookie_returns_401(self):
+    def test_dashboard_wrong_cookie_still_returns_200(self):
+        """Wrong cookie no longer gates the page; JS/localStorage owns auth."""
         r = CLIENT.get("/admin/dashboard", cookies={"admin_access": "wrong-token"})
-        assert r.status_code == 401
+        assert r.status_code == 200
 
     def test_dashboard_valid_cookie_returns_200(self):
         r = CLIENT.get("/admin/dashboard", cookies={"admin_access": ADMIN_TOKEN})
@@ -477,3 +479,223 @@ class TestDocsEndpoints:
         data = r.json()
         paths = data.get("paths", {})
         assert any("admin" in p for p in paths), "Admin paths not visible with admin cookie"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Static source file safety — wrong ports and production URLs
+# ─────────────────────────────────────────────────────────────────────────────
+
+import re
+from pathlib import Path
+
+# Ports explicitly allowed to be hardcoded in source files
+_ALLOWED_PORTS = {
+    5000,   # production API port
+    6379,   # Redis default
+    6380,   # Redis failover/sentinel
+}
+
+# Production URL patterns that must NOT appear in source files
+_FORBIDDEN_URL_PATTERNS = [
+    r"eternitylabs\.co",
+    r"cache-api\.\w+\.co",
+]
+
+# The 5 core source files to scan
+_SOURCE_FILES = ["main.py", "redis_cache.py", "request_tracking.py", "cache_db.py", "deploy.sh"]
+
+
+class TestSourceFileSafety:
+    """
+    Static scans of the 5 core source files.
+    Catches hardcoded wrong ports and hardcoded production URLs
+    before they can break the production deployment.
+    """
+
+    def _read(self, filename: str) -> str:
+        p = Path(filename)
+        if not p.exists():
+            pytest.skip(f"{filename} not present in this environment")
+        return p.read_text(encoding="utf-8")
+
+    def _check_ports(self, filename: str, pattern: str):
+        content = self._read(filename)
+        found = {int(m) for m in re.findall(pattern, content, re.IGNORECASE)}
+        bad = found - _ALLOWED_PORTS
+        assert not bad, (
+            f"{filename} contains hardcoded port(s) {bad} outside the allowed set {_ALLOWED_PORTS}.\n"
+            f"Use environment variables (e.g. os.getenv('API_PORT', '5000')) instead of hardcoding ports."
+        )
+
+    def _check_urls(self, filename: str):
+        content = self._read(filename)
+        for pattern in _FORBIDDEN_URL_PATTERNS:
+            hits = re.findall(pattern, content)
+            assert not hits, (
+                f"{filename} contains a hardcoded production URL matching '{pattern}': {hits}\n"
+                f"Production URLs must only appear in testing.py or be read from environment variables."
+            )
+
+    def test_main_py_no_wrong_ports(self):
+        self._check_ports("main.py", r"(?:port\s*=\s*|:)(\d{4,5})\b")
+
+    def test_redis_cache_py_no_wrong_ports(self):
+        self._check_ports("redis_cache.py", r"(?:port\s*=\s*|:)(\d{4,5})\b")
+
+    def test_request_tracking_py_no_wrong_ports(self):
+        self._check_ports("request_tracking.py", r"(?:port\s*=\s*|:)(\d{4,5})\b")
+
+    def test_cache_db_py_no_wrong_ports(self):
+        self._check_ports("cache_db.py", r"(?:port\s*=\s*|:)(\d{4,5})\b")
+
+    def test_deploy_sh_no_wrong_ports(self):
+        # In shell, default port values appear as :-5000 or port=5000
+        self._check_ports("deploy.sh", r"(?::-|port\s*=\s*[\"']?)(\d{4,5})\b")
+
+    def test_main_py_no_hardcoded_production_url(self):
+        self._check_urls("main.py")
+
+    def test_redis_cache_py_no_hardcoded_production_url(self):
+        self._check_urls("redis_cache.py")
+
+    def test_request_tracking_py_no_hardcoded_production_url(self):
+        self._check_urls("request_tracking.py")
+
+    def test_cache_db_py_no_hardcoded_production_url(self):
+        self._check_urls("cache_db.py")
+
+    def test_deploy_sh_no_hardcoded_production_url(self):
+        self._check_urls("deploy.sh")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Source file coverage snapshot — fails when new functions/endpoints are added
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# HOW TO FIX A FAILURE:
+#   1. Add tests in test_pr.py covering the new endpoint or function.
+#   2. Add the new item to the relevant KNOWN_* set below.
+# ─────────────────────────────────────────────────────────────────────────────
+
+KNOWN_ENDPOINTS = {
+    # (HTTP_METHOD, "/path")
+    ("GET",    "/"),
+    ("GET",    "/health"),
+    ("GET",    "/cache/stats"),
+    ("DELETE", "/cache/clear"),
+    ("DELETE", "/cache/invalidate"),
+    ("GET",    "/cache"),
+    ("POST",   "/cache/batch"),
+    ("POST",   "/cache/batch/precision"),
+    ("GET",    "/leagues"),
+    ("GET",    "/admin/logs"),
+    ("GET",    "/admin/sessions"),
+    ("GET",    "/admin/stats/cache"),
+    ("GET",    "/admin/missing-items"),
+    ("DELETE", "/admin/missing-items"),
+    ("GET",    "/admin/dashboard"),
+    ("POST",   "/admin/dashboard/login"),
+    ("GET",    "/docs"),
+    ("GET",    "/openapi.json"),
+}
+
+KNOWN_CACHE_DB_FUNCTIONS = {
+    "get_db_connection", "normalize_key", "get_league_priority",
+    "expand_sports_terms", "get_cache_entry", "get_all_teams",
+    "get_all_players", "_chunk_list", "_resolve_batch_teams",
+    "_resolve_batch_players", "_resolve_bulk_markets",
+    "get_batch_cache_entries", "get_precision_batch_cache_entries",
+    "get_all_leagues",
+}
+
+KNOWN_REDIS_CACHE_FUNCTIONS = {
+    "_iter_cache_keys", "_count_cache_keys", "get_redis_client",
+    "generate_cache_key", "get_cached_data", "set_cached_data",
+    "invalidate_cache", "clear_all_cache", "get_cache_stats",
+}
+
+KNOWN_REQUEST_TRACKING_FUNCTIONS = {
+    "get_location_from_ip", "get_db_connection", "init_tracking",
+    "create_session", "get_or_create_session", "track_request",
+    "get_request_logs", "get_session_summary", "get_session_details",
+    "clear_old_sessions", "track_missing_item", "get_missing_items",
+    "clear_missing_items",
+}
+
+KNOWN_DEPLOY_SH_VARS = {
+    "SERVICE_NAME", "SERVICE_DIR", "VENV_DIR", "SERVICE_FILE",
+    "REPO_URL", "DEPLOY_BRANCH", "API_PORT", "EXPECTED_REPO_SLUG",
+    "PREVIOUS_SERVICE_NAME", "SOURCE_REPO_SLUG", "PRIMARY_REPO_SLUG",
+    "ALLOW_PRIMARY_SERVICE_NAME", "PRODUCTION_SERVICE_NAME",
+    "PRODUCTION_PORT", "NGINX_SITE_NAME", "PROTECTED_NGINX_SITE_NAME",
+    "REQUIRE_UNIQUE_NAME", "LOCK_FILE",
+    # ANSI colour helpers (not deployment config)
+    "RED", "GREEN", "YELLOW", "NC",
+}
+
+
+def _scan_endpoints(filepath: str) -> set:
+    """Extract all (METHOD, /path) pairs from @app.{method}("/path") decorators."""
+    content = Path(filepath).read_text(encoding="utf-8")
+    pattern = re.compile(r'@app\.(get|post|put|delete|patch)\s*\(\s*["\']([^"\']+)["\']', re.IGNORECASE)
+    return {(m.group(1).upper(), m.group(2)) for m in pattern.finditer(content)}
+
+
+def _scan_functions(filepath: str) -> set:
+    """Extract all top-level def names from a Python file."""
+    content = Path(filepath).read_text(encoding="utf-8")
+    return {m.group(1) for m in re.finditer(r'^(?:async\s+)?def\s+(\w+)\s*\(', content, re.MULTILINE)}
+
+
+def _scan_deploy_vars(filepath: str) -> set:
+    """Extract all UPPER_CASE variable assignments from deploy.sh."""
+    content = Path(filepath).read_text(encoding="utf-8")
+    return {m.group(1) for m in re.finditer(r'^([A-Z_][A-Z0-9_]+)\s*=', content, re.MULTILINE)}
+
+
+class TestSourceFileCoverage:
+    """
+    Snapshot tests: fail when new endpoints or functions are added to key files
+    without corresponding tests being written.
+
+    If this test fails on your PR:
+      1. Add tests in test_pr.py for the new endpoint/function.
+      2. Add the new item to the relevant KNOWN_* set in this file.
+    """
+
+    def _assert_snapshot(self, label: str, actual: set, known: set):
+        new = actual - known
+        removed = known - actual
+        assert not new, (
+            f"\n❌ NEW items in {label} — add tests, then add these to the KNOWN set:\n"
+            + "\n".join(f"  {i}" for i in sorted(str(x) for x in new))
+        )
+        assert not removed, (
+            f"\n⚠️  Items removed from {label} but still in the KNOWN set — remove them:\n"
+            + "\n".join(f"  {i}" for i in sorted(str(x) for x in removed))
+        )
+
+    def test_main_py_no_new_endpoints(self):
+        if not Path("main.py").exists():
+            pytest.skip("main.py not present")
+        self._assert_snapshot("main.py endpoints", _scan_endpoints("main.py"), KNOWN_ENDPOINTS)
+
+    def test_cache_db_py_no_new_functions(self):
+        if not Path("cache_db.py").exists():
+            pytest.skip("cache_db.py not present")
+        self._assert_snapshot("cache_db.py functions", _scan_functions("cache_db.py"), KNOWN_CACHE_DB_FUNCTIONS)
+
+    def test_redis_cache_py_no_new_functions(self):
+        if not Path("redis_cache.py").exists():
+            pytest.skip("redis_cache.py not present")
+        self._assert_snapshot("redis_cache.py functions", _scan_functions("redis_cache.py"), KNOWN_REDIS_CACHE_FUNCTIONS)
+
+    def test_request_tracking_py_no_new_functions(self):
+        if not Path("request_tracking.py").exists():
+            pytest.skip("request_tracking.py not present")
+        self._assert_snapshot("request_tracking.py functions", _scan_functions("request_tracking.py"), KNOWN_REQUEST_TRACKING_FUNCTIONS)
+
+    def test_deploy_sh_no_new_config_vars(self):
+        if not Path("deploy.sh").exists():
+            pytest.skip("deploy.sh not present")
+        self._assert_snapshot("deploy.sh variables", _scan_deploy_vars("deploy.sh"), KNOWN_DEPLOY_SH_VARS)
