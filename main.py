@@ -249,42 +249,9 @@ app.mount("/admin/js", StaticFiles(directory="js"), name="admin_js")
 app.mount("/admin/css", StaticFiles(directory="css"), name="admin_css")
 
 @app.get("/admin/dashboard", tags=["admin"])
-async def serve_dashboard(admin_access: Optional[str] = Cookie(None)):
-        """Serve the admin dashboard (cookie-auth in browser)."""
-        if admin_access and admin_access == ADMIN_KEY:
-                return FileResponse("dashboard.html")
-
-        return HTMLResponse(
-                status_code=401,
-                content="""
-<!DOCTYPE html>
-<html lang=\"en\">
-<head>
-    <meta charset=\"UTF-8\" />
-    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\" />
-    <title>Admin Login</title>
-    <style>
-        body { font-family: Arial, sans-serif; background: #f5f7fb; margin: 0; }
-        .card { max-width: 420px; margin: 12vh auto; background: #fff; padding: 24px; border-radius: 10px; box-shadow: 0 8px 24px rgba(0,0,0,0.08); }
-        h2 { margin-top: 0; font-size: 22px; }
-        p { color: #555; }
-        input { width: 100%; box-sizing: border-box; padding: 10px; margin: 10px 0 14px; border: 1px solid #d0d7e2; border-radius: 6px; }
-        button { width: 100%; padding: 10px; border: 0; border-radius: 6px; background: #1f6feb; color: #fff; font-weight: 600; cursor: pointer; }
-    </style>
-</head>
-<body>
-    <div class=\"card\">
-        <h2>Admin Dashboard Login</h2>
-        <p>Enter your admin token to continue.</p>
-        <form method=\"post\" action=\"/admin/dashboard/login\">
-            <input type=\"password\" name=\"admin_token\" placeholder=\"Admin token\" required />
-            <button type=\"submit\">Open Dashboard</button>
-        </form>
-    </div>
-</body>
-</html>
-                """,
-        )
+async def serve_dashboard():
+        """Serve the admin dashboard. Auth is handled client-side via JS/localStorage."""
+        return FileResponse("dashboard.html")
 
 
 @app.post("/admin/dashboard/login", tags=["admin"], include_in_schema=False)

@@ -120,6 +120,19 @@ async function handleLogin() {
             localStorage.setItem('adminToken', token);
             localStorage.setItem('isLoggedIn', 'true');
             if (elements.testerToken) elements.testerToken.value = token;
+
+            // Also set the server-side cookie so cookie-aware flows stay in sync.
+            try {
+                const form = new URLSearchParams();
+                form.append('admin_token', token);
+                await fetch(`${CONFIG.apiBaseUrl}/admin/dashboard/login`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                    body: form.toString(),
+                    redirect: 'manual',   // don't follow the 303, we stay on this page
+                });
+            } catch (_) { /* non-critical */ }
+
             showDashboard();
         } else {
             showLoginError('Invalid API Token');
@@ -152,6 +165,8 @@ function handleLogout() {
     state.isLoggedIn = false;
     localStorage.removeItem('isLoggedIn');
     localStorage.removeItem('adminToken');
+    // Expire the server-side cookie so the server state is also cleared.
+    document.cookie = 'admin_access=; Max-Age=0; path=/; Secure; SameSite=Strict';
     window.location.reload();
 }
 
