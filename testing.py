@@ -709,6 +709,14 @@ def run_full_suite(
                 cookies={"admin_access": admin_token},
             )
         )
+        # Token management
+        results.append(run_case(env_name, base_url, "list tokens", "GET", "/admin/tokens", {200}, token=admin_token))
+        results.append(run_case(env_name, base_url, "token audit log", "GET", "/admin/tokens/audit", {200}, token=admin_token))
+        # Analytics
+        results.append(run_case(env_name, base_url, "analytics failures", "GET", "/admin/analytics/failures", {200}, token=admin_token))
+        results.append(run_case(env_name, base_url, "analytics latency", "GET", "/admin/analytics/latency", {200}, token=admin_token))
+        results.append(run_case(env_name, base_url, "analytics signatures", "GET", "/admin/analytics/signatures", {200}, token=admin_token))
+        results.append(run_case(env_name, base_url, "analytics trends", "GET", "/admin/analytics/trends", {200}, token=admin_token))
 
         if include_destructive:
             results.append(run_case(env_name, base_url, "cache clear (destructive)", "DELETE", "/cache/clear", {200}, token=admin_token))

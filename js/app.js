@@ -200,6 +200,10 @@ function switchTab(tabId) {
         updateStats();
     } else if (tabId === 'missing') {
         fetchMissingData();
+    } else if (tabId === 'tokens') {
+        fetchTokens();
+    } else if (tabId === 'analytics') {
+        fetchAnalytics();
     }
 }
 
@@ -760,4 +764,397 @@ async function clearMissingData() {
         console.error('Error clearing missing data:', error);
         showNotification('Failed to clear missing data: ' + error.message, 'error');
     }
+}
+
+// ─── Token Management ──────────────────────────────────────────────────────────
+
+async function fetchTokens() {
+    const token = localStorage.getItem('adminToken');
+    if (!token) return;
+    const tbody = document.getElementById('tokensTableBody');
+    if (tbody) tbody.innerHTML = '<tr><td colspan="10" class="text-center">Loading...</td></tr>';
+    try {
+        const res = await fetch(`${CONFIG.apiBaseUrl}/admin/tokens`, {
+            headers: { 'Authorization': `Bearer ${token}` }
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        renderTokens(data.tokens || []);
+    } catch (e) {
+        if (tbody) tbody.innerHTML = `<tr><td colspan="10" class="text-center">${escapeHtml(e.message)}</td></tr>`;
+    }
+}
+
+function renderTokens(tokens) {
+    const tbody = document.getElementById('tokensTableBody');
+    if (!tbody) return;
+
+    const summary = document.getElementById('tokensSummary');
+    if (summary) {
+        const total = tokens.length;
+        const active = tokens.filter(t => t.status === 'active').length;
+        const admins = tokens.filter(t => t.role === 'admin' && t.status === 'active').length;
+        const revoked = tokens.filter(t => t.status === 'revoked').length;
+        summary.innerHTML = [
+            { label: 'Total Tokens', value: total, color: '#4f46e5' },
+            { label: 'Active', value: active, color: '#22c55e' },
+            { label: 'Admin Tokens', value: admins, color: '#f59e0b' },
+            { label: 'Revoked', value: revoked, color: '#ef4444' },
+        ].map(c => `
+            <div style="background:#fff; border:1px solid #e5e7eb; border-radius:10px; padding:16px; border-left:4px solid ${c.color};">
+                <div style="font-size:0.8rem; color:#6b7280; margin-bottom:4px;">${c.label}</div>
+                <div style="font-size:1.8rem; font-weight:700; color:${c.color};">${c.value}</div>
+            </div>
+        `).join('');
+    }
+
+    if (!tokens.length) {
+        tbody.innerHTML = '<tr><td colspan="10" class="text-center">No tokens found</td></tr>';
+        return;
+    }
+
+    tbody.innerHTML = tokens.map(t => {
+        const statusBadge = t.status === 'active'
+            ? `<span class="token-badge-active">active</span>`
+            : `<span class="token-badge-revoked">revoked</span>`;
+        const roleBadge = t.role === 'admin'
+            ? `<span class="token-badge-admin">admin</span>`
+            : `<span class="token-badge-user">user</span>`;
+        const actions = t.status === 'active' ? `
+            <button class="btn-token-action" onclick="revokeToken('${t.token_id}','${escapeHtml(t.name)}')" title="Revoke">\uD83D\uDEAB</button>
+            <button class="btn-token-action" onclick="rotateToken('${t.token_id}','${escapeHtml(t.name)}')" title="Rotate">\uD83D\uDD04</button>
+        ` : '';
+        return `<tr>
+            <td><strong>${escapeHtml(t.name)}</strong></td>
+            <td>${escapeHtml(t.owner || '—')}</td>
+            <td>${roleBadge}</td>
+            <td><code style="font-size:0.85em;">${escapeHtml(t.token_masked)}</code></td>
+            <td>${statusBadge}</td>
+            <td><small>${formatTimestamp(t.created_at)}</small></td>
+            <td><small>${t.last_used ? formatTimestamp(t.last_used) : '—'}</small></td>
+            <td><small>${escapeHtml(t.last_ip || '—')}</small></td>
+            <td><small>${escapeHtml(t.expires_at || '—')}</small></td>
+            <td>${actions}</td>
+        </tr>`;
+    }).join('');
+}
+
+async function fetchTokenAudit(tokenId = null) {
+    const token = localStorage.getItem('adminToken');
+    if (!token) return;
+    const tbody = document.getElementById('tokenAuditTableBody');
+    if (tbody) tbody.innerHTML = '<tr><td colspan="6" class="text-center">Loading...</td></tr>';
+    try {
+        const url = tokenId
+            ? `${CONFIG.apiBaseUrl}/admin/tokens/audit?token_id=${tokenId}&limit=50`
+            : `${CONFIG.apiBaseUrl}/admin/tokens/audit?limit=100`;
+        const res = await fetch(url, { headers: { 'Authorization': `Bearer ${token}` } });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        renderAuditLog(data.audit || []);
+    } catch (e) {
+        if (tbody) tbody.innerHTML = `<tr><td colspan="6" class="text-center">${escapeHtml(e.message)}</td></tr>`;
+    }
+}
+
+function renderAuditLog(entries) {
+    const tbody = document.getElementById('tokenAuditTableBody');
+    if (!tbody) return;
+    if (!entries.length) {
+        tbody.innerHTML = '<tr><td colspan="6" class="text-center">No audit entries</td></tr>';
+        return;
+    }
+    const actionColor = { created: '#22c55e', revoked: '#ef4444', rotated_out: '#f59e0b' };
+    tbody.innerHTML = entries.map(e => `<tr>
+        <td><small>${formatTimestamp(e.timestamp)}</small></td>
+        <td><code style="font-size:0.85em;">${escapeHtml(e.token_masked || '—')}</code></td>
+        <td><span style="padding:2px 8px; border-radius:4px; background:${actionColor[e.action] || '#6b7280'}; color:#fff; font-size:0.8em;">${escapeHtml(e.action)}</span></td>
+        <td>${escapeHtml(e.actor || '—')}</td>
+        <td>${escapeHtml(e.ip_address || '—')}</td>
+        <td>${escapeHtml(e.reason || '—')}</td>
+    </tr>`).join('');
+}
+
+function openCreateTokenModal() {
+    const modal = document.getElementById('createTokenModal');
+    if (modal) modal.style.display = 'flex';
+}
+
+function closeCreateTokenModal() {
+    const modal = document.getElementById('createTokenModal');
+    if (modal) modal.style.display = 'none';
+    ['newTokenName', 'newTokenOwner', 'newTokenNotes', 'newTokenExpires'].forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.value = '';
+    });
+    const role = document.getElementById('newTokenRole');
+    if (role) role.value = 'user';
+}
+
+async function submitCreateToken() {
+    const adminToken = localStorage.getItem('adminToken');
+    if (!adminToken) return;
+    const name = document.getElementById('newTokenName')?.value.trim();
+    if (!name) { showNotification('Name is required', 'error'); return; }
+    const body = {
+        name,
+        owner: document.getElementById('newTokenOwner')?.value.trim() || null,
+        role: document.getElementById('newTokenRole')?.value || 'user',
+        notes: document.getElementById('newTokenNotes')?.value.trim() || null,
+        expires_at: document.getElementById('newTokenExpires')?.value.trim() || null,
+    };
+    try {
+        const res = await fetch(`${CONFIG.apiBaseUrl}/admin/tokens`, {
+            method: 'POST',
+            headers: { 'Authorization': `Bearer ${adminToken}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify(body),
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        closeCreateTokenModal();
+        showNewTokenModal(data);
+        fetchTokens();
+    } catch (e) {
+        showNotification('Failed to create token: ' + e.message, 'error');
+    }
+}
+
+function showNewTokenModal(tokenInfo) {
+    const modal = document.getElementById('newTokenModal');
+    const rawInput = document.getElementById('newTokenRaw');
+    const details = document.getElementById('newTokenDetails');
+    if (rawInput) rawInput.value = tokenInfo.raw_token || '';
+    if (details) details.innerHTML = `
+        <strong>Name:</strong> ${escapeHtml(tokenInfo.name)} &nbsp;
+        <strong>Role:</strong> ${escapeHtml(tokenInfo.role)} &nbsp;
+        <strong>Masked:</strong> <code>${escapeHtml(tokenInfo.token_masked)}</code>
+    `;
+    if (modal) modal.style.display = 'flex';
+}
+
+function closeNewTokenModal() {
+    const modal = document.getElementById('newTokenModal');
+    if (modal) modal.style.display = 'none';
+    const raw = document.getElementById('newTokenRaw');
+    if (raw) raw.value = '';
+}
+
+function copyNewToken() {
+    const raw = document.getElementById('newTokenRaw');
+    if (!raw) return;
+    raw.select();
+    document.execCommand('copy');
+    showNotification('Token copied to clipboard!', 'success');
+}
+
+async function revokeToken(tokenId, name) {
+    if (!confirm(`Revoke token "${name}"? This cannot be undone.`)) return;
+    const adminToken = localStorage.getItem('adminToken');
+    if (!adminToken) return;
+    try {
+        const res = await fetch(`${CONFIG.apiBaseUrl}/admin/tokens/${tokenId}/revoke`, {
+            method: 'PUT',
+            headers: { 'Authorization': `Bearer ${adminToken}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ reason: 'Revoked via dashboard' }),
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        showNotification(`Token "${name}" revoked`, 'success');
+        fetchTokens();
+        fetchTokenAudit();
+    } catch (e) {
+        showNotification('Failed to revoke: ' + e.message, 'error');
+    }
+}
+
+async function rotateToken(tokenId, name) {
+    if (!confirm(`Rotate token "${name}"? Old token will be revoked and a new one created.`)) return;
+    const adminToken = localStorage.getItem('adminToken');
+    if (!adminToken) return;
+    try {
+        const res = await fetch(`${CONFIG.apiBaseUrl}/admin/tokens/${tokenId}/rotate`, {
+            method: 'POST',
+            headers: { 'Authorization': `Bearer ${adminToken}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ reason: 'Rotated via dashboard' }),
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        showNewTokenModal(data);
+        fetchTokens();
+        fetchTokenAudit();
+    } catch (e) {
+        showNotification('Failed to rotate: ' + e.message, 'error');
+    }
+}
+
+// ─── Analytics ────────────────────────────────────────────────────────────────
+
+async function fetchAnalytics() {
+    const token = localStorage.getItem('adminToken');
+    if (!token) return;
+    const hours = document.getElementById('analyticsHours')?.value || 24;
+    try {
+        const [failRes, sigRes, latRes, trendRes] = await Promise.all([
+            fetch(`${CONFIG.apiBaseUrl}/admin/analytics/failures?hours=${hours}`, { headers: { 'Authorization': `Bearer ${token}` } }),
+            fetch(`${CONFIG.apiBaseUrl}/admin/analytics/signatures?hours=${hours}&limit=20`, { headers: { 'Authorization': `Bearer ${token}` } }),
+            fetch(`${CONFIG.apiBaseUrl}/admin/analytics/latency?hours=${hours}`, { headers: { 'Authorization': `Bearer ${token}` } }),
+            fetch(`${CONFIG.apiBaseUrl}/admin/analytics/trends?hours=${hours}`, { headers: { 'Authorization': `Bearer ${token}` } }),
+        ]);
+        if (failRes.ok) {
+            const d = await failRes.json();
+            renderAnalyticsSummary(d);
+            renderFailuresByPath(d.by_path || []);
+            renderFailuresByStatus(d.by_status_code || []);
+        }
+        if (sigRes.ok) {
+            const d = await sigRes.json();
+            renderTopSignatures(d.signatures || []);
+        }
+        if (latRes.ok) {
+            const d = await latRes.json();
+            renderLatencyStats(d.endpoints || []);
+        }
+        if (trendRes.ok) {
+            const d = await trendRes.json();
+            renderTrends(d.buckets || []);
+        }
+    } catch (e) {
+        console.error('Analytics fetch error:', e);
+        showNotification('Failed to load analytics: ' + e.message, 'error');
+    }
+}
+
+function renderAnalyticsSummary(failData) {
+    const container = document.getElementById('analyticsSummary');
+    if (!container) return;
+    const totalFails = (failData.by_status_code || []).reduce((s, r) => s + r.count, 0);
+    const e4xx = (failData.by_status_code || []).filter(r => r.status >= 400 && r.status < 500).reduce((s, r) => s + r.count, 0);
+    const e5xx = (failData.by_status_code || []).filter(r => r.status >= 500).reduce((s, r) => s + r.count, 0);
+    const affectedPaths = (failData.by_path || []).length;
+    container.innerHTML = [
+        { label: 'Total Failures', value: totalFails, color: '#ef4444' },
+        { label: '4xx Errors', value: e4xx, color: '#f59e0b' },
+        { label: '5xx Errors', value: e5xx, color: '#dc2626' },
+        { label: 'Affected Endpoints', value: affectedPaths, color: '#4f46e5' },
+    ].map(c => `
+        <div style="background:#fff; border:1px solid #e5e7eb; border-radius:10px; padding:16px; border-left:4px solid ${c.color};">
+            <div style="font-size:0.8rem; color:#6b7280; margin-bottom:4px;">${c.label}</div>
+            <div style="font-size:1.8rem; font-weight:700; color:${c.color};">${c.value}</div>
+        </div>
+    `).join('');
+}
+
+function renderFailuresByPath(rows) {
+    const tbody = document.getElementById('failuresByPathBody');
+    if (!tbody) return;
+    if (!rows.length) { tbody.innerHTML = '<tr><td colspan="3" class="text-center">No failures</td></tr>'; return; }
+    const max = rows[0].count || 1;
+    tbody.innerHTML = rows.slice(0, 10).map(r => {
+        const pct = Math.round((r.count / max) * 100);
+        return `<tr>
+            <td><code style="font-size:0.85em;">${escapeHtml(r.path)}</code></td>
+            <td><strong>${r.count}</strong></td>
+            <td><div style="background:#fee2e2; border-radius:4px; height:8px;">
+                <div style="width:${pct}%; background:#ef4444; height:8px; border-radius:4px;"></div>
+            </div></td>
+        </tr>`;
+    }).join('');
+}
+
+function renderFailuresByStatus(rows) {
+    const tbody = document.getElementById('failuresByStatusBody');
+    if (!tbody) return;
+    if (!rows.length) { tbody.innerHTML = '<tr><td colspan="3" class="text-center">No failures</td></tr>'; return; }
+    const max = Math.max(...rows.map(r => r.count)) || 1;
+    const colors = { 400: '#f59e0b', 401: '#f59e0b', 403: '#f59e0b', 404: '#64748b', 429: '#f97316', 500: '#ef4444', 502: '#dc2626', 503: '#dc2626' };
+    tbody.innerHTML = rows.map(r => {
+        const pct = Math.round((r.count / max) * 100);
+        const color = colors[r.status] || '#6b7280';
+        return `<tr>
+            <td><span style="padding:2px 8px; border-radius:4px; background:${color}; color:#fff; font-size:0.85em;">${r.status}</span></td>
+            <td><strong>${r.count}</strong></td>
+            <td><div style="background:#f3f4f6; border-radius:4px; height:8px;">
+                <div style="width:${pct}%; background:${color}; height:8px; border-radius:4px;"></div>
+            </div></td>
+        </tr>`;
+    }).join('');
+}
+
+function renderTopSignatures(sigs) {
+    const tbody = document.getElementById('topSignaturesBody');
+    if (!tbody) return;
+    if (!sigs.length) { tbody.innerHTML = '<tr><td colspan="6" class="text-center">No data</td></tr>'; return; }
+    tbody.innerHTML = sigs.map(s => {
+        const params = typeof s.query_params === 'object' ? JSON.stringify(s.query_params) : String(s.query_params || '');
+        return `<tr>
+            <td><code style="font-size:0.85em;">${escapeHtml(s.path)}</code></td>
+            <td><span style="padding:2px 6px; border-radius:4px; background:#fee2e2; color:#991b1b; font-size:0.85em;">${s.response_status}</span></td>
+            <td style="font-size:0.85em; color:#64748b; max-width:200px; overflow:hidden; text-overflow:ellipsis;">${escapeHtml(params)}</td>
+            <td><strong>${s.count}</strong></td>
+            <td><small>${formatTimestamp(s.first_seen)}</small></td>
+            <td><small>${formatTimestamp(s.last_seen)}</small></td>
+        </tr>`;
+    }).join('');
+}
+
+function renderLatencyStats(endpoints) {
+    const tbody = document.getElementById('latencyBody');
+    if (!tbody) return;
+    if (!endpoints.length) { tbody.innerHTML = '<tr><td colspan="8" class="text-center">No data</td></tr>'; return; }
+    tbody.innerHTML = endpoints.map(e => `<tr>
+        <td><code style="font-size:0.85em;">${escapeHtml(e.path)}</code></td>
+        <td>${e.count}</td>
+        <td>${e.min_ms}</td>
+        <td>${e.avg_ms}</td>
+        <td>${e.p50_ms}</td>
+        <td style="${e.p95_ms > 500 ? 'color:#ef4444; font-weight:600;' : ''}">${e.p95_ms}</td>
+        <td style="${e.p99_ms > 1000 ? 'color:#dc2626; font-weight:700;' : ''}">${e.p99_ms}</td>
+        <td>${e.max_ms}</td>
+    </tr>`).join('');
+}
+
+function renderTrends(buckets) {
+    const container = document.getElementById('trendsChart');
+    if (!container) return;
+    if (!buckets.length) {
+        container.innerHTML = '<p style="text-align:center; color:#9ca3af; padding:20px 0;">No data for selected period</p>';
+        return;
+    }
+    const maxTotal = Math.max(...buckets.map(b => b.total)) || 1;
+    container.innerHTML = `
+        <div style="display:flex; align-items:flex-end; gap:4px; height:100px; overflow-x:auto; padding-bottom:4px;">
+            ${buckets.map(b => {
+                const hTotal = Math.max(2, Math.round((b.total / maxTotal) * 90));
+                const hErr = b.total > 0 ? Math.round((b.errors / b.total) * hTotal) : 0;
+                const label = b.bucket ? b.bucket.substring(11, 16) : '';
+                return `<div style="display:flex; flex-direction:column; align-items:center; flex:1; min-width:28px; gap:2px;" title="${escapeHtml(b.bucket)}: ${b.total} total, ${b.errors} errors">
+                    <div style="width:100%; display:flex; flex-direction:column; justify-content:flex-end; height:90px;">
+                        <div style="background:#ef4444; height:${hErr}px; border-radius:2px 2px 0 0;"></div>
+                        <div style="background:#4f46e5; height:${hTotal - hErr}px;"></div>
+                    </div>
+                    <div style="font-size:0.65rem; color:#9ca3af; white-space:nowrap;">${escapeHtml(label)}</div>
+                </div>`;
+            }).join('')}
+        </div>
+        <div style="display:flex; gap:16px; margin-top:8px; font-size:0.8rem; color:#6b7280;">
+            <span><span style="display:inline-block; width:10px; height:10px; background:#4f46e5; border-radius:2px; margin-right:4px;"></span>Success</span>
+            <span><span style="display:inline-block; width:10px; height:10px; background:#ef4444; border-radius:2px; margin-right:4px;"></span>Errors</span>
+        </div>
+    `;
+}
+
+function exportAnalytics() {
+    const token = localStorage.getItem('adminToken');
+    if (!token) return;
+    const hours = document.getElementById('analyticsHours')?.value || 24;
+    fetch(`${CONFIG.apiBaseUrl}/admin/analytics/failures?hours=${hours}`, { headers: { 'Authorization': `Bearer ${token}` } })
+        .then(r => r.json())
+        .then(data => {
+            const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+            const a = document.createElement('a');
+            a.href = URL.createObjectURL(blob);
+            a.download = `analytics_failures_${hours}h_${new Date().toISOString().slice(0,10)}.json`;
+            a.click();
+            URL.revokeObjectURL(a.href);
+        })
+        .catch(e => showNotification('Export failed: ' + e.message, 'error'));
 }

@@ -1,22 +1,57 @@
 # Cache API
 
-FastAPI service for sports cache normalization with Redis-backed caching, batch lookup support, request/session tracking, and VPS auto-deployment.
+FastAPI service for sports cache normalization with Redis-backed caching, batch lookup support, request/session tracking, missing-item telemetry, GeoIP enrichment, and VPS auto-deployment.
 
 ## What this service does
 
 - Normalizes cache lookups for `market`, `team`, `player`, and `league`
-- Supports single query and two batch modes
-- Exposes admin-only cache and request/session monitoring endpoints
-- Uses Redis for caching and SQLite-backed lookup data
-- Deploys to VPS through GitHub Actions + `deploy.sh`
+- Supports single query, standard batch, and precision batch modes
+- Tracks every non-admin request with session continuity, GeoIP location, and per-request UUID
+- Records items not found in the database so gaps can be identified and prioritized
+- Provides full **token governance**: create, revoke, rotate, and audit DB-managed API tokens with SHA-256 hashing and masked display
+- Exposes **request failure analytics**: failure heatmaps, latency stats, top failing query signatures, and request trends
+- Exposes admin-only endpoints for cache management, request/session monitoring, and missing-item reports
+- Serves a browser-based admin dashboard (8 tabs: Overview, Sessions, API Tester, Server Logs, Missing Data, Tokens, Analytics, Settings)
+- Uses Redis for caching and SQLite for both lookup data and telemetry storage
+- Deploys to VPS through GitHub Actions + `deploy.sh` with fork-safety guards and retry logic
 
 ## Tech stack
 
 - FastAPI + Uvicorn
 - Redis (`redis`, `hiredis`)
-- SQLite data files
-- systemd service management
+- SQLite (sports data + request tracking + UUID tracking)
+- `geoip2` + MaxMind GeoLite2-City database (local IP geolocation for request logs)
+- `python-multipart` (form-based dashboard login)
+- systemd service management on VPS
 - Nginx reverse proxy on VPS
+
+## Project structure
+
+```
+main.py               # FastAPI app, all routes, middleware, startup logic
+cache_db.py           # SQLite query layer (sports_data.db) with Redis cache integration
+redis_cache.py        # Redis client, cache key generation, stats, clear, invalidate
+request_tracking.py   # SQLite-backed request/session/missing-item tracking
+uuid_tracking.py      # UUID-based login tracking with geo-location via ip-api.com
+testing.py            # Full endpoint validation runner (local vs prod)
+test_pr.py            # Automated pytest suite for PRs (no live server needed)
+deploy.sh             # VPS deployment script (systemd, nginx, Redis)
+dashboard.html        # Admin dashboard (served at /admin/dashboard)
+js/app.js             # Dashboard frontend JavaScript
+css/style.css         # Dashboard styles
+geoip/GeoLite2-City.mmdb  # MaxMind GeoLite2 database for IP geolocation
+.github/workflows/
+  deploy.yml          # CI/CD: validate + deploy on push to main
+  cleanup.yml         # Auto-delete head branch on PR close
+```
+
+## Data stores
+
+| File                       | Purpose                                                                                  |
+| -------------------------- | ---------------------------------------------------------------------------------------- |
+| `sports_data.db`           | Primary SQLite database for markets, teams, players, leagues (WAL mode, 10 MB cache)     |
+| `request_logs/requests.db` | Request telemetry: sessions, per-request logs, missing-item records, tokens, token audit |
+| `uuid_tracking.db`         | UUID login tracking with full geo-location data per visit                                |
 
 ## Quick start (local)
 
@@ -50,6 +85,8 @@ Default local URL:
 http://localhost:5000
 ```
 
+On Windows, if `REDIS_HOST` is not set the app automatically locates and starts any Docker container whose name or image contains `redis`. If none exists, it creates one named `local-redis` mapping port `6379`.
+
 ## Authentication
 
 Protected endpoints require:
@@ -58,90 +95,218 @@ Protected endpoints require:
 Authorization: Bearer <token>
 ```
 
-- `API_TOKEN`: user token for non-admin endpoints
-- `ADMIN_API_TOKEN` / `ADMIN_TOKEN`: admin token for admin endpoints
+Two token sources are supported, checked in order:
 
-If no valid tokens are configured, protected routes return server error.
+1. **Environment-variable tokens** — `API_TOKEN` (user) and `ADMIN_API_TOKEN` / `ADMIN_TOKEN` (admin). Fast-path checked first.
+2. **Database-managed tokens** — created via `POST /admin/tokens`, stored as SHA-256 hashes in `request_logs/requests.db`. Support expiry dates, revocation, rotation, and per-token audit logs.
+
+If no valid tokens are configured, protected routes return a `500` error. Token values are `.strip()`-ed on load to avoid whitespace issues.
+
+### Admin dashboard login
+
+The dashboard at `/admin/dashboard` uses cookie-based auth. Submit the admin token via the login form:
+
+```
+POST /admin/dashboard/login
+Content-Type: application/x-www-form-urlencoded
+
+admin_token=<admin_token>
+```
+
+On success, a `HttpOnly; Secure; SameSite=Strict` cookie named `admin_access` is set (1-hour lifetime) and the browser is redirected to the dashboard. The Swagger UI at `/docs` also reads this cookie to reveal admin-tagged routes in the OpenAPI spec.
 
 ## Rate limiting
 
 - Per-IP in-memory limiter
 - Controlled by `RATE_LIMIT_PER_MINUTE` (default `60`)
 - Applied to user API routes (`/cache`, `/cache/batch`, `/cache/batch/precision`, `/leagues`)
+- Returns `429 Too Many Requests` when exceeded
+
+## Request tracking and observability
+
+Every non-admin request is tracked automatically via HTTP middleware:
+
+- A stable `session_id` (UUID) is assigned per token, persisted across requests
+- A per-request `uuid` is derived deterministically from the token using `uuid5`
+- IP address is resolved to a city/country via the local GeoLite2 database
+- Request method, path, query params, body, response status, and latency are stored
+- Items that return `null` (not found in DB) are recorded in a `missing_items` table with deduplication, `occurrence_count`, and `request_group_id` for grouping per-request
+
+Admin requests are not tracked (no session created, no request record written).
+
+### UUID tracking
+
+`uuid_tracking.py` maintains a separate `uuid_tracking.db` that records every bearer-token appearance with full geo-location from the `ip-api.com` API (HTTPS, free tier: 45 req/min). Private/loopback IPs are handled gracefully and not submitted to the external API.
+
+## GeoIP
+
+Two separate geo-lookup mechanisms are used:
+
+| Used in               | Source                     | Method                                                       |
+| --------------------- | -------------------------- | ------------------------------------------------------------ |
+| `request_tracking.py` | `geoip/GeoLite2-City.mmdb` | Local MaxMind GeoLite2 via `geoip2` library, no network call |
+| `uuid_tracking.py`    | `ip-api.com` (HTTPS)       | External API call, includes ISP, coordinates, timezone       |
+
+The MaxMind database file is required at `geoip/GeoLite2-City.mmdb`. If absent, location fields are stored as `null` without error.
 
 ## API endpoints
 
 ### Public
 
 - `GET /`
-  - Service status/metadata
+  - Service status and version metadata
 
 ### Authenticated (user or admin token)
 
 - `GET /cache`
   - Query params: `market`, `team`, `player`, `sport`, `league`
   - Validation:
-    - at least one of `market|team|player|league` is required
-    - `sport` required for team-only search
-    - `sport` required for league search
+    - at least one of `market|team|player|league` required
+    - `sport` required for team-only searches
+    - `sport` required for league searches
+  - Returns `404` with `found: false` when no match; missing items are recorded automatically
 - `POST /cache/batch`
   - Body fields: `team[]`, `player[]`, `market[]`, `sport`, `league[]`
-  - Independent batch lookup per category
+  - Independent lookup per category; each item resolves separately
+  - Missing items tracked per request group
 - `POST /cache/batch/precision`
-  - Body: `{ "queries": [ {team/player/market/sport/league...}, ... ] }`
-  - Combined-parameter precision lookups
+  - Body: `{ "queries": [ { team/player/market/sport/league ... }, ... ] }`
+  - Combined-parameter precision lookups; each query item can mix parameters to narrow results
+  - Returns `results[]` with `total_queries`, `successful`, `failed` summary
 - `GET /leagues`
   - Query params: `sport`, `search`, `region`
+  - Partial-match search, priority-ordered results (top 5 leagues first)
 
 ### Admin-only
 
 - `GET /health`
+  - Returns service status and Redis cache stats
 - `GET /cache/stats`
+  - Detailed Redis cache statistics
 - `DELETE /cache/clear`
-- `DELETE /cache/invalidate` (query params: `market`, `team`, `player`, `sport`, `league`)
+  - Clears all Redis cache entries
+- `DELETE /cache/invalidate`
+  - Query params: `market`, `team`, `player`, `sport`, `league`
+  - Invalidates one specific cache key
 - `GET /admin/dashboard`
-- `GET /admin/logs` (`limit`, `offset`, optional `session_id`, `path`)
+  - Serves the HTML admin dashboard (auth handled client-side via cookie)
+- `POST /admin/dashboard/login`
+  - Form login endpoint; sets `admin_access` cookie on success
+- `GET /admin/logs`
+  - Query params: `limit` (default 100), `offset`, optional `session_id`, `path`
+  - Paginated request log viewer
 - `GET /admin/sessions`
+  - Active session summary (token type, request count, last activity)
 - `GET /admin/stats/cache`
+  - Redis cache statistics (alias for `/cache/stats`, accessible from dashboard)
+- `GET /admin/missing-items`
+  - Query params: `item_type` (optional filter), `limit`, `offset`, `sort_by` (default `last_seen`)
+  - Returns deduplicated log of items not found in the database, with occurrence counts
+- `DELETE /admin/missing-items`
+  - Query param: `item_type` (optional; omit to clear all)
+  - Deletes missing-item records
+
+### Token management (admin-only)
+
+- `GET /admin/tokens`
+  - Lists all tokens with masked values, owner, role, status, created/last-used dates
+- `POST /admin/tokens`
+  - Body: `{ "name": str, "role": "user"|"admin", "expires_at": "YYYY-MM-DDTHH:MM:SS" (optional) }`
+  - Creates a new DB-managed token; returns the raw token once (not stored in plaintext)
+  - Validates: `name` and `role` required, `expires_at` must be a valid ISO datetime if provided
+- `PUT /admin/tokens/{token_id}/revoke`
+  - Body: `{ "reason": str (optional) }`
+  - Immediately revokes a token; rejected requests return `401` until token is deleted
+- `POST /admin/tokens/{token_id}/rotate`
+  - Generates a replacement token and deprecates the old one atomically
+  - Returns the new raw token (shown once)
+- `GET /admin/tokens/audit`
+  - Returns the token usage/event audit log (create, rotate, revoke, use)
+
+### Analytics (admin-only)
+
+- `GET /admin/analytics/failures`
+  - Failure counts grouped by endpoint and HTTP status code with time-window filtering
+- `GET /admin/analytics/latency`
+  - Average, p50, p95, and p99 latency per endpoint
+- `GET /admin/analytics/signatures`
+  - Top failing query parameter signatures (market/team/player/sport/league combinations) with counts and recent samples
+- `GET /admin/analytics/trends`
+  - Request volume and error-rate trends over configurable time windows
 
 ### Docs/OpenAPI behavior
 
-- `GET /docs` serves Swagger UI
-- `GET /openapi.json` hides routes tagged `admin` unless valid admin cookie is present
+- `GET /docs` — Swagger UI
+- `GET /openapi.json` — hides routes tagged `admin` unless a valid `admin_access` cookie is present
 
 ## Environment variables
 
 Core runtime variables:
 
-- `API_TOKEN`
-- `ADMIN_API_TOKEN` (fallback: `ADMIN_TOKEN`)
-- `RATE_LIMIT_PER_MINUTE` (default `60`)
-- `REDIS_HOST`, `REDIS_PORT`, `REDIS_DB`, `REDIS_PASSWORD`
-- `CACHE_TTL`
+| Variable                | Default     | Description                                  |
+| ----------------------- | ----------- | -------------------------------------------- |
+| `API_TOKEN`             | —           | User-level bearer token                      |
+| `ADMIN_API_TOKEN`       | —           | Admin bearer token (fallback: `ADMIN_TOKEN`) |
+| `RATE_LIMIT_PER_MINUTE` | `60`        | Max requests per IP per minute               |
+| `REDIS_HOST`            | `localhost` | Redis hostname                               |
+| `REDIS_PORT`            | `6379`      | Redis port                                   |
+| `REDIS_DB`              | `0`         | Redis database index                         |
+| `REDIS_PASSWORD`        | —           | Redis password (if required)                 |
+| `CACHE_TTL`             | `3600`      | Redis cache TTL in seconds                   |
+
+CI/CD smoke-test email alert variables (set as GitHub repository secrets):
+
+| Variable             | Description                                      |
+| -------------------- | ------------------------------------------------ |
+| `GMAIL_SENDER`       | Gmail address used to send deploy-failure alerts |
+| `GMAIL_APP_PASSWORD` | 16-character Gmail App Password                  |
+| `ADMIN_EMAIL`        | Recipient address for alert emails               |
+
+Generate strong tokens with:
+
+```bash
+python -c "import secrets; print(secrets.token_urlsafe(32))"
+```
 
 Notes:
 
-- `main.py` currently runs Uvicorn on port `5000` when started directly.
-- On Windows local development, app attempts to auto-start Docker container `local-redis` if `REDIS_HOST` is unset.
+- `main.py` runs Uvicorn on port `5000` when started directly.
+- On Windows without `REDIS_HOST` set, the app auto-discovers and starts any Docker Redis container at startup.
 
-## Testing utility
+## Automated PR tests (`test_pr.py`)
 
-`testing.py` is now a full endpoint validation runner.
+`test_pr.py` is a `pytest` suite that runs on every pull request in GitHub Actions. It uses FastAPI's `TestClient` — no live server, no real secrets, and no external DB needed.
+
+- Dummy tokens are injected via environment variables before the app is imported
+- Redis is patched to return `None` instantly (no TCP timeouts during test runs)
+- All DB functions (`get_cache_entry`, `get_batch_cache_entries`, etc.) are mocked
+- Covers: root endpoint, auth layer (missing/wrong/valid token), admin-only rejection, key endpoint shapes, request body validation, token management lifecycle, and analytics endpoints
+
+Run locally:
+
+```bash
+pip install pytest httpx
+pytest test_pr.py -v -p no:playwright
+```
+
+## Testing utility (`testing.py`)
+
+`testing.py` is a full endpoint validation runner for live environments.
 
 ### Supported modes
 
 ```bash
-python testing.py --mode quick --token <user_token>
-python testing.py --mode compare --token <user_token>
+python testing.py --mode quick     --token <user_token>
+python testing.py --mode compare   --token <user_token>
 python testing.py --mode extensive --token <user_token>
-python testing.py --mode full --target prod --token <user_token> --admin-token <admin_token>
+python testing.py --mode full      --target prod --token <user_token> --admin-token <admin_token>
 ```
 
 Mode summary:
 
 - `quick`: smoke run for `/cache/batch` on local + prod
-- `compare`: deep diff for `/cache/batch` payload responses (local vs prod)
-- `extensive`: broader local-vs-prod combinations for `/cache`, `/cache/batch`, `/cache/batch/precision`, `/leagues`
+- `compare`: deep diff of `/cache/batch` payload responses between local and prod
+- `extensive`: broader local-vs-prod coverage for `/cache`, `/cache/batch`, `/cache/batch/precision`, `/leagues`
 - `full` (default): endpoint health/auth/user/admin validation with pass/fail summary
 
 ### Target selection
@@ -152,8 +317,8 @@ python testing.py --mode full --target local --token <user_token> --admin-token 
 python testing.py --mode full --target both  --token <user_token> --admin-token <admin_token>
 ```
 
-- `prod`: only production base URL
-- `local`: only local base URL
+- `prod`: production base URL only (`https://cache-api.eternitylabs.co`)
+- `local`: local base URL only (`http://127.0.0.1:5000`)
 - `both`: runs both environments (default)
 
 ### Token and environment variable fallback
@@ -182,7 +347,7 @@ This currently enables testing `DELETE /cache/clear`.
 
 - Each test line prints endpoint, status, expected status, latency, and `ok=True/False`
 - Final summary prints `total`, `passed`, `failed`
-- Exit code is `0` only when all checks pass; otherwise `1` (CI-friendly)
+- Exit code `0` when all checks pass; `1` otherwise (CI-friendly)
 
 ### Coverage counts (full mode)
 
@@ -194,8 +359,8 @@ Per target environment (`prod` or `local`), `--mode full` currently runs:
 
 Distinct endpoints covered in full mode:
 
-- `14` endpoints by default
-- `15` endpoints when destructive check is enabled
+- `20` endpoints by default
+- `21` endpoints when destructive check is enabled
 
 Endpoint list covered:
 
@@ -203,6 +368,8 @@ Endpoint list covered:
 - `/cache`, `/cache/batch`, `/cache/batch/precision`, `/leagues`
 - `/health`, `/cache/stats`, `/cache/invalidate`
 - `/admin/dashboard`, `/admin/logs`, `/admin/sessions`, `/admin/stats/cache`
+- `/admin/tokens`, `/admin/tokens/audit`
+- `/admin/analytics/failures`, `/admin/analytics/latency`, `/admin/analytics/signatures`, `/admin/analytics/trends`
 - optional: `/cache/clear`
 
 ### Filter/combination coverage
@@ -219,14 +386,38 @@ Current suite includes the following parameter/body combination coverage:
 
 ## Deployment flow (GitHub Actions + VPS)
 
-Push to `main` triggers `.github/workflows/deploy.yml`, which:
+### Workflows
 
-1. Runs deployment preflight guard checks
-2. SSHes to VPS
-3. Executes `deploy.sh`
-4. Updates repo in target service directory
-5. Installs/updates dependencies
-6. Manages systemd service + restart + verification
+Two workflows live in `.github/workflows/`:
+
+**`deploy.yml`** — triggered on push to `main`, manual dispatch, or PR targeting `main`:
+
+1. `validate` job: syntax check all Python files + run `pytest test_pr.py`
+2. `deploy` job (push to `main` only, skipped on PRs):
+   - Runs preflight fork-safety guard checks
+   - SSHes to VPS and executes `deploy.sh` (up to 2 attempts with 10-second retry gap)
+   - On success, runs a smoke test against the live service
+   - On smoke-test failure, sends an email alert via Gmail (configurable via secrets)
+   - Verifies `systemctl status` after deploy
+
+**`cleanup.yml`** — triggered when a pull request is closed (merged or declined):
+
+- Automatically deletes the head branch (skips `main` and `develop`)
+
+### `deploy.sh` behavior
+
+The deployment script (`deploy.sh`):
+
+- Acquires a per-service lock file (`/tmp/<service-name>.deploy.lock`) to prevent parallel deploy races
+- Verifies it is running as the `ubuntu` user
+- Installs Redis via `apt` if not already present, then ensures `redis-server` is running
+- Clones the repo into `SERVICE_DIR` if not already present; otherwise `git pull`
+- Creates and activates a Python virtual environment
+- Installs/upgrades dependencies from `requirements.txt`
+- Writes/updates a `systemd` unit file and reloads the daemon
+- Optionally removes a previous service name (`PREVIOUS_SERVICE_NAME`) to handle renames
+- Configures Nginx with a server block pointing to the API port
+- Restarts and verifies the service
 
 ### Required deploy secrets
 
@@ -246,25 +437,21 @@ Push to `main` triggers `.github/workflows/deploy.yml`, which:
 
 ## Fork-safe production protection
 
-The deploy system now blocks non-primary repositories from using protected production resources.
+The deploy system blocks non-primary repositories from colliding with production resources.
 
 Guard error codes you may see:
 
-- `GUARD:SERVICE_NAME_RESERVED`
-  - Non-primary repo tried to use protected service name
-- `GUARD:PORT_RESERVED`
-  - Non-primary repo tried to use protected production port
-- `GUARD:NGINX_SITE_RESERVED`
-  - Non-primary repo tried to use protected nginx site name
-- `GUARD:NGINX_SITE_EXISTS`
-  - Chosen nginx site already exists on VPS
+- `GUARD:SERVICE_NAME_RESERVED` — non-primary repo tried to use the protected service name
+- `GUARD:PORT_RESERVED` — non-primary repo tried to use the protected production port
+- `GUARD:NGINX_SITE_RESERVED` — non-primary repo tried to use the protected nginx site name
+- `GUARD:NGINX_SITE_EXISTS` — chosen nginx site already exists on VPS
 
 Fix for fork/secondary deployments:
 
-- Set unique `DEPLOY_SERVICE_NAME`
-- Set unique `DEPLOY_DIR`
-- Set unique `DEPLOY_PORT`
-- Set unique `DEPLOY_NGINX_SITE_NAME`
+- Set a unique `DEPLOY_SERVICE_NAME`
+- Set a unique `DEPLOY_DIR`
+- Set a unique `DEPLOY_PORT`
+- Set a unique `DEPLOY_NGINX_SITE_NAME`
 
 ## Troubleshooting
 
@@ -292,51 +479,62 @@ Nginx config dump:
 sudo nginx -T
 ```
 
+Redis connectivity (local):
+
+```bash
+redis-cli ping
+```
+
 ## Security hygiene
 
-- Never commit real API/admin tokens, SSH keys, or passwords
-- Keep `.env` local and rotated if leaked
-- Use least-privilege deploy credentials
-- Keep fork deployments isolated by unique service/port/nginx identity
+- Never commit real API/admin tokens, SSH keys, or passwords to the repository
+- Keep `.env` local and rotate tokens if leaked
+- Use least-privilege deploy credentials on the VPS
+- Keep fork deployments isolated via unique service name, port, and nginx site
+- Admin cookie (`admin_access`) is `HttpOnly`, `Secure`, and `SameSite=Strict`
+- Redis SCAN is used instead of KEYS to avoid blocking production Redis
 
-## Dashboard roadmap (planning only)
+## Security hardening
 
-This section is a **future plan only** for admin-dashboard improvements. No items below are implemented yet unless already documented elsewhere.
+The following security controls are in place (all active as of server restart):
 
-### 1) Token governance and visibility
+| #   | Area              | Control                                                                                                                                                                                             |
+| --- | ----------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1   | Token exposure    | `GET /docs?admin_token=` triggers an immediate 302 redirect stripping the token from the URL, preventing it from appearing in server logs, browser history, or `Referer` headers                    |
+| 2   | Brute force       | `POST /admin/dashboard/login` is rate-limited to 10 attempts per IP per minute; excess attempts return `429`                                                                                        |
+| 3   | Timing attacks    | All token comparisons use `hmac.compare_digest` (constant-time) rather than `==`                                                                                                                    |
+| 4   | Input validation  | `POST /admin/tokens` validates `expires_at` via Pydantic `@field_validator`; malformed values return `422` without silently failing. DB layer uses fail-safe expiry (`return None` on `ValueError`) |
+| 5   | Error leakage     | `500` error responses return `"Internal server error"` generic text only; full exception details are printed server-side and never sent to clients                                                  |
+| 6   | Schema exposure   | `/openapi.json` hides admin-tagged paths unless a valid admin cookie (`admin_access`) is present; DB-managed admin tokens are also accepted                                                         |
+| 7   | Session isolation | Sessions are keyed by `(ip_address, user_agent, user_identifier)` so different tokens from the same IP/browser get independent session records                                                      |
+| 8   | Input bounds      | `CreateTokenRequest` fields enforce `min_length=1`, `max_length=100`, and `role` must match `^(user\|admin)$`                                                                                       |
 
-Goal: give admins full visibility into token distribution and usage.
+## Dashboard roadmap
 
-Planned features:
+All three planned improvements have been implemented.
 
-- Token inventory table (masked token, owner, created date, last used, status)
-- Token distribution summary (active vs inactive, admin vs user, tokens by owner/team)
-- Token usage trends (requests/day per token, unique IPs, last 24h / 7d / 30d)
-- Token risk indicators (unused long-term, abnormal request bursts, unknown geo/IP)
+### 1) Token governance and visibility — ✅ implemented
 
-### 2) Token lifecycle management
+- Token inventory table (masked token, owner/name, created date, last used, status, role)
+- Token distribution summary visible in the Tokens tab
+- Token usage tracking via `token_audit` table (`log_token_use` records every accepted request)
+- Token risk indicators: revoked tokens return `401` immediately
 
-Goal: allow secure creation and management of user tokens directly from dashboard.
+### 2) Token lifecycle management — ✅ implemented
 
-Planned features:
+- Create token with name, role (`user`/`admin`), and optional expiry date
+- Revoke token immediately via `PUT /admin/tokens/{id}/revoke` with optional reason
+- Rotate token atomically via `POST /admin/tokens/{id}/rotate` (old token deprecated, new token returned once)
+- Full audit trail in `token_audit` table for all create/rotate/revoke/use events
+- Pydantic validation on all inputs with constant-time comparison and SHA-256 storage
 
-- Create token (name/owner/role/expiry/rate-limit profile)
-- Revoke/disable token immediately
-- Rotate token (generate replacement + deprecate old token)
-- Optional scoped permissions by endpoint group
-- Audit trail for token create/rotate/revoke events
+### 3) Request failure analytics — ✅ implemented
 
-### 3) Request failure analytics
-
-Goal: quickly answer "which requests are failing and why".
-
-Planned features:
-
-- Failure heatmap by endpoint + status code
-- Drill-down by parameter patterns (market/team/player/sport/league)
-- Top failing query signatures with counts and recent samples
-- Time-window comparison (e.g., last 1h vs previous 1h)
-- Export failed-request report (CSV/JSON)
+- Failure heatmap by endpoint + status code via `GET /admin/analytics/failures`
+- Latency stats (avg, p50, p95, p99) per endpoint via `GET /admin/analytics/latency`
+- Top failing query signatures (parameter pattern + count + recent samples) via `GET /admin/analytics/signatures`
+- Request volume and error-rate trends via `GET /admin/analytics/trends`
+- All analytics data visible in the Analytics tab of the dashboard
 
 ### 4) Missing-filter intelligence
 

@@ -12,7 +12,8 @@ from fastapi.responses import JSONResponse, FileResponse, HTMLResponse, Redirect
 from fastapi.staticfiles import StaticFiles
 from fastapi.concurrency import run_in_threadpool
 from typing import Optional, Dict, Any, List
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
+import hmac
 import uvicorn
 import os
 import platform
@@ -137,6 +138,7 @@ VALID_API_TOKENS = {token for token in [ADMIN_KEY, NON_ADMIN_KEY] if token}
 
 # Rate limiting configuration
 RATE_LIMIT_PER_MINUTE = int(os.getenv('RATE_LIMIT_PER_MINUTE', 60))
+LOGIN_ATTEMPT_LIMIT = 10  # max dashboard login attempts per IP per minute
 rate_limit_storage = defaultdict(list)
 
 def check_rate_limit(client_ip: str) -> bool:
@@ -182,51 +184,59 @@ async def verify_rate_limit(request: Request):
             detail=f"Rate limit exceeded. Maximum {RATE_LIMIT_PER_MINUTE} requests per minute allowed."
         )
 
+def _safe_eq(a: str, b) -> bool:
+    """Constant-time string comparison to prevent timing-based token enumeration."""
+    if not b:
+        return False
+    return hmac.compare_digest(a.encode(), b.encode())
+
+
 def verify_token(credentials: HTTPAuthorizationCredentials = Security(security)) -> str:
     """
     Verify the API token from the Authorization header.
-    Allows both admin and non-admin tokens.
-    
-    Raises:
-        HTTPException: If token is invalid or missing
-    
-    Returns:
-        The validated token
+    Allows both admin and non-admin tokens (env-var or DB-managed).
     """
+    token = credentials.credentials
+
+    # Fast path: env-var configured tokens (constant-time to resist timing attacks)
+    if any(_safe_eq(token, t) for t in VALID_API_TOKENS):
+        return token
+
+    # Fallback: DB-managed tokens (multi-token support)
+    db_tok = request_tracking.verify_db_token(token)
+    if db_tok:
+        return token
+
     if not VALID_API_TOKENS:
         raise HTTPException(
             status_code=500,
             detail="No API tokens configured. Please set API_TOKEN in environment variables."
         )
-    
-    token = credentials.credentials
-    if token not in VALID_API_TOKENS:
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid or expired API token"
-        )
-    
-    return token
+    raise HTTPException(
+        status_code=401,
+        detail="Invalid or expired API token"
+    )
+
 
 def verify_admin_token(credentials: HTTPAuthorizationCredentials = Security(security)) -> str:
     """
-    Verify the API token is an admin token.
+    Verify the API token is an admin token (env-var or DB-managed admin role).
     Restricts access to admin-only endpoints.
-    
-    Raises:
-        HTTPException: If token is invalid, missing, or not an admin token
-    
-    Returns:
-        The validated admin token
     """
     token = credentials.credentials
-    if token != ADMIN_KEY:
-        raise HTTPException(
-            status_code=403,
-            detail="Admin access required. This endpoint requires an admin API token."
-        )
-    
-    return token
+
+    # Fast path: env-var admin token (constant-time comparison)
+    if _safe_eq(token, ADMIN_KEY):
+        return token
+
+    # Fallback: DB-managed admin tokens
+    if request_tracking.is_admin_db_token(token):
+        return token
+
+    raise HTTPException(
+        status_code=403,
+        detail="Admin access required. This endpoint requires an admin API token."
+    )
 
 app = FastAPI(
     title="Cache API",
@@ -243,6 +253,8 @@ app = FastAPI(
 async def startup_containers():
     if platform.system() == "Windows" and not os.getenv('REDIS_HOST'):
         ensure_redis_container()
+    # Seed env-var tokens into the managed token store (idempotent)
+    await run_in_threadpool(request_tracking.seed_env_tokens, ADMIN_KEY, NON_ADMIN_KEY)
 
 # Mount static files for dashboard
 app.mount("/admin/js", StaticFiles(directory="js"), name="admin_js")
@@ -255,20 +267,30 @@ async def serve_dashboard():
 
 
 @app.post("/admin/dashboard/login", tags=["admin"], include_in_schema=False)
-async def dashboard_login(admin_token: str = Form(...)):
-        if admin_token != ADMIN_KEY:
-                return HTMLResponse(status_code=403, content="Invalid admin token")
+async def dashboard_login(request: Request, admin_token: str = Form(...)):
+    # Brute-force guard: max LOGIN_ATTEMPT_LIMIT failed attempts per IP per minute
+    client_ip = request.client.host if request.client else "unknown"
+    now = time.time()
+    login_key = f"login:{client_ip}"
+    login_attempts = [t for t in rate_limit_storage.get(login_key, []) if now - t < 60]
+    if len(login_attempts) >= LOGIN_ATTEMPT_LIMIT:
+        return HTMLResponse(status_code=429, content="Too many login attempts. Try again later.")
+    login_attempts.append(now)
+    rate_limit_storage[login_key] = login_attempts
 
-        response = RedirectResponse(url="/admin/dashboard", status_code=303)
-        response.set_cookie(
-                key="admin_access",
-                value=admin_token,
-                max_age=3600,
-                httponly=True,
-                secure=True,
-                samesite="strict",
-        )
-        return response
+    if not _safe_eq(admin_token, ADMIN_KEY) and not request_tracking.is_admin_db_token(admin_token):
+        return HTMLResponse(status_code=403, content="Invalid admin token")
+
+    response = RedirectResponse(url="/admin/dashboard", status_code=303)
+    response.set_cookie(
+        key="admin_access",
+        value=admin_token,
+        max_age=3600,
+        httponly=True,
+        secure=True,
+        samesite="strict",
+    )
+    return response
 
 # Middleware for request tracking (UUID + GeoIP + Sessions)
 @app.middleware("http")
@@ -297,7 +319,8 @@ async def track_request_middleware(request: Request, call_next):
             token = auth_header.split(" ")[1]
 
         if token:
-            is_admin = (token == ADMIN_KEY)
+            is_admin = _safe_eq(token, ADMIN_KEY) or request_tracking.is_admin_db_token(token)
+            request.state.is_admin = is_admin
             if not is_admin:
                 user_uuid = str(uuid.uuid5(uuid.NAMESPACE_DNS, token))
 
@@ -335,7 +358,12 @@ async def track_request_middleware(request: Request, call_next):
             token = auth_header.split(" ")[1]
 
         if token:
-            is_admin = (token == ADMIN_KEY)
+            is_admin = getattr(request.state, 'is_admin', None)
+            if is_admin is None:
+                is_admin = _safe_eq(token, ADMIN_KEY) or request_tracking.is_admin_db_token(token)
+            # Only update last-used when the request actually authenticated (not 401/403)
+            if response.status_code not in (401, 403):
+                request_tracking.log_token_use(token, ip_address)
             if not is_admin and session_id:
                 user_uuid = str(uuid.uuid5(uuid.NAMESPACE_DNS, token))
                 tracked_body = getattr(request.state, 'body_data', {})
@@ -378,6 +406,34 @@ class PrecisionBatchItem(BaseModel):
 class PrecisionBatchRequest(BaseModel):
     """Request model for precision batch queries"""
     queries: List[PrecisionBatchItem]
+
+
+class CreateTokenRequest(BaseModel):
+    """Request model for creating a managed API token"""
+    name: str = Field(..., min_length=1, max_length=100)
+    owner: Optional[str] = Field(None, max_length=100)
+    role: str = Field("user", pattern=r"^(user|admin)$")
+    notes: Optional[str] = Field(None, max_length=500)
+    expires_at: Optional[str] = Field(None)
+
+    @field_validator('expires_at')
+    @classmethod
+    def validate_expires_at(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None:
+            try:
+                from datetime import datetime as _dt
+                _dt.fromisoformat(v)
+            except ValueError:
+                raise ValueError('expires_at must be a valid ISO datetime, e.g. 2027-01-01T00:00:00')
+        return v
+
+
+class RevokeRequest(BaseModel):
+    reason: Optional[str] = None
+
+
+class RotateRequest(BaseModel):
+    reason: Optional[str] = None
 
 @app.get("/")
 async def root():
@@ -600,10 +656,8 @@ async def get_cache(
         )
         
     except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error retrieving cache entry: {str(e)}"
-        )
+        print(f"[ERROR] GET /cache: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 @app.post("/cache/batch")
 async def get_batch_cache(
@@ -723,10 +777,8 @@ async def get_batch_cache(
         )
         
     except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error processing batch query: {str(e)}"
-        )
+        print(f"[ERROR] POST /cache/batch: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 @app.post("/cache/batch/precision")
 async def get_precision_batch_cache(
@@ -796,10 +848,8 @@ async def get_precision_batch_cache(
         )
         
     except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error processing precision batch query: {str(e)}"
-        )
+        print(f"[ERROR] POST /cache/batch/precision: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @app.get("/leagues")
@@ -843,10 +893,8 @@ async def get_leagues(
         )
         
     except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error retrieving leagues: {str(e)}"
-        )
+        print(f"[ERROR] GET /leagues: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @app.get("/admin/logs", tags=["admin"])
@@ -900,29 +948,168 @@ async def clear_missing_items(
     request_tracking.clear_missing_items(item_type=item_type)
     return {"message": "Missing items cleared successfully"}
 
+
+# ─── Token Management Endpoints ─────────────────────────────────────────────────────
+
+@app.get("/admin/tokens", tags=["admin"])
+async def list_tokens(token: str = Depends(verify_admin_token)):
+    """List all managed tokens with metadata (requires admin authentication)"""
+    tokens = await run_in_threadpool(request_tracking.get_all_tokens)
+    return {"tokens": tokens, "total": len(tokens)}
+
+
+@app.post("/admin/tokens", tags=["admin"])
+async def create_token(
+    request: Request,
+    body: CreateTokenRequest = Body(...),
+    token: str = Depends(verify_admin_token)
+):
+    """Create a new managed API token (requires admin authentication). The raw token is returned ONCE — store it immediately."""
+    if body.role not in ("user", "admin"):
+        raise HTTPException(status_code=400, detail="role must be 'user' or 'admin'")
+    ip_address = request.client.host if request.client else "unknown"
+    result = await run_in_threadpool(
+        request_tracking.create_managed_token,
+        name=body.name,
+        owner=body.owner,
+        role=body.role,
+        notes=body.notes,
+        expires_at=body.expires_at,
+        actor="admin",
+        ip_address=ip_address,
+    )
+    return result
+
+
+@app.put("/admin/tokens/{token_id}/revoke", tags=["admin"])
+async def revoke_managed_token(
+    request: Request,
+    token_id: str,
+    body: RevokeRequest = Body(default=RevokeRequest()),
+    token: str = Depends(verify_admin_token)
+):
+    """Revoke a managed token (requires admin authentication)"""
+    ip_address = request.client.host if request.client else "unknown"
+    ok = await run_in_threadpool(
+        request_tracking.revoke_token,
+        token_id=token_id,
+        actor="admin",
+        reason=body.reason,
+        ip_address=ip_address,
+    )
+    if not ok:
+        raise HTTPException(status_code=404, detail="Token not found")
+    return {"status": "revoked", "token_id": token_id}
+
+
+@app.post("/admin/tokens/{token_id}/rotate", tags=["admin"])
+async def rotate_managed_token(
+    request: Request,
+    token_id: str,
+    body: RotateRequest = Body(default=RotateRequest()),
+    token: str = Depends(verify_admin_token)
+):
+    """Rotate a managed token: old token revoked, new token returned once (requires admin authentication)"""
+    ip_address = request.client.host if request.client else "unknown"
+    result = await run_in_threadpool(
+        request_tracking.rotate_token,
+        token_id=token_id,
+        actor="admin",
+        reason=body.reason,
+        ip_address=ip_address,
+    )
+    if result is None:
+        raise HTTPException(status_code=404, detail="Token not found")
+    return result
+
+
+@app.get("/admin/tokens/audit", tags=["admin"])
+async def get_token_audit_log(
+    token_id: Optional[str] = Query(None),
+    limit: int = Query(100, le=500),
+    token: str = Depends(verify_admin_token)
+):
+    """Get token audit log (requires admin authentication)"""
+    entries = await run_in_threadpool(
+        request_tracking.get_token_audit,
+        token_id=token_id,
+        limit=limit,
+    )
+    return {"audit": entries, "total": len(entries)}
+
+
+# ─── Analytics Endpoints ───────────────────────────────────────────────────────────
+
+@app.get("/admin/analytics/failures", tags=["admin"])
+async def analytics_failures(
+    hours: int = Query(24, ge=1, le=720),
+    token: str = Depends(verify_admin_token)
+):
+    """Failure analytics grouped by endpoint and status code (requires admin authentication)"""
+    return await run_in_threadpool(request_tracking.get_failure_analytics, hours)
+
+
+@app.get("/admin/analytics/signatures", tags=["admin"])
+async def analytics_signatures(
+    hours: int = Query(24, ge=1, le=720),
+    limit: int = Query(20, le=100),
+    token: str = Depends(verify_admin_token)
+):
+    """Top failing request signatures with occurrence counts (requires admin authentication)"""
+    result = await run_in_threadpool(request_tracking.get_top_failing_signatures, limit, hours)
+    return {"signatures": result, "total": len(result), "hours": hours}
+
+
+@app.get("/admin/analytics/latency", tags=["admin"])
+async def analytics_latency(
+    hours: int = Query(24, ge=1, le=720),
+    token: str = Depends(verify_admin_token)
+):
+    """Latency percentiles per endpoint (min, avg, p50, p95, p99, max) (requires admin authentication)"""
+    result = await run_in_threadpool(request_tracking.get_latency_stats, hours)
+    return {"endpoints": result, "hours": hours}
+
+
+@app.get("/admin/analytics/trends", tags=["admin"])
+async def analytics_trends(
+    hours: int = Query(24, ge=1, le=720),
+    token: str = Depends(verify_admin_token)
+):
+    """Request volume trends bucketed by hour (requires admin authentication)"""
+    result = await run_in_threadpool(request_tracking.get_request_trends, hours)
+    return {"buckets": result, "hours": hours}
+
+
 @app.get("/docs", include_in_schema=False)
 async def custom_swagger_ui_html(admin_token: Optional[str] = Query(None)):
     """
-    Custom Swagger UI that can set an admin cookie if provided in query param.
+    Custom Swagger UI. When admin_token is provided as a query parameter, set
+    the auth cookie then immediately redirect to /docs (token stripped from URL
+    so it never appears in server logs, browser history, or Referer headers).
     """
-    response = get_swagger_ui_html(
+    if admin_token:
+        is_valid = _safe_eq(admin_token, ADMIN_KEY) or request_tracking.is_admin_db_token(admin_token)
+        redirect = RedirectResponse(url="/docs", status_code=302)
+        if is_valid:
+            redirect.set_cookie(
+                key="admin_access", value=admin_token,
+                max_age=3600, httponly=True, secure=True, samesite="strict"
+            )
+        return redirect
+    return get_swagger_ui_html(
         openapi_url="/openapi.json",
         title=app.title + " - Swagger UI",
         oauth2_redirect_url=app.swagger_ui_oauth2_redirect_url,
         swagger_js_url="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5.9.0/swagger-ui-bundle.js",
         swagger_css_url="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5.9.0/swagger-ui.css",
     )
-    if admin_token and admin_token == ADMIN_KEY:
-        # Set max_age to 1 hour (3600 seconds)
-        response.set_cookie(key="admin_access", value=admin_token, max_age=3600, httponly=True, secure=True, samesite="strict")
-    return response
 
 @app.get("/openapi.json", include_in_schema=False)
 async def custom_openapi(admin_access: Optional[str] = Cookie(None)):
     """
     Custom OpenAPI schema endpoint that filters admin routes if no valid admin cookie is present.
     """
-    if admin_access and admin_access == ADMIN_KEY:
+    if admin_access and (_safe_eq(admin_access, ADMIN_KEY) or request_tracking.is_admin_db_token(admin_access)):
         return get_openapi(
             title=app.title,
             version=app.version,

@@ -8,6 +8,8 @@ import sqlite3
 import json
 import os
 import uuid
+import hashlib
+import secrets as _secrets
 from datetime import datetime
 from typing import Optional, Dict, Any, List
 from contextlib import contextmanager
@@ -138,6 +140,39 @@ def init_tracking():
         conn.execute('CREATE INDEX IF NOT EXISTS idx_missing_items_type ON missing_items(item_type)')
         conn.execute('CREATE INDEX IF NOT EXISTS idx_missing_items_request_group_id ON missing_items(request_group_id)')
 
+        # Token management tables
+        conn.execute('''
+        CREATE TABLE IF NOT EXISTS tokens (
+            token_id TEXT PRIMARY KEY,
+            token_hash TEXT UNIQUE NOT NULL,
+            token_masked TEXT NOT NULL,
+            name TEXT NOT NULL,
+            owner TEXT,
+            role TEXT NOT NULL DEFAULT 'user',
+            created_at TEXT NOT NULL,
+            last_used TEXT,
+            last_ip TEXT,
+            status TEXT NOT NULL DEFAULT 'active',
+            expires_at TEXT,
+            notes TEXT
+        )
+        ''')
+        conn.execute('''
+        CREATE TABLE IF NOT EXISTS token_audit (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            token_id TEXT,
+            token_masked TEXT,
+            action TEXT NOT NULL,
+            actor TEXT,
+            timestamp TEXT NOT NULL,
+            ip_address TEXT,
+            reason TEXT
+        )
+        ''')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_tokens_hash ON tokens(token_hash)')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_tokens_status ON tokens(status)')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_token_audit_tid ON token_audit(token_id)')
+
     print(f"Request tracking initialized. Database: {DB_FILE}")
 
 def create_session(user_identifier: str, ip_address: str, user_agent: str, token_type: str) -> str:
@@ -168,13 +203,17 @@ def get_or_create_session(token: str, ip_address: str, user_agent: str, user_ide
     except ImportError:
         token_type = "non-admin" 
 
+    # Resolve identifier early so we can use it in the session lookup
+    identifier = user_identifier or "user_unknown"
+
     with get_db_connection() as conn:
-        # Check for existing session matching IP and User Agent
+        # Include user_identifier in the query so different API tokens from the
+        # same IP/browser do not share a session record (prevents cross-user leakage).
         cursor = conn.execute('''
         SELECT session_id FROM sessions 
-        WHERE ip_address = ? AND user_agent = ? 
+        WHERE ip_address = ? AND user_agent = ? AND user_identifier = ?
         ORDER BY last_activity DESC LIMIT 1
-        ''', (ip_address, user_agent))
+        ''', (ip_address, user_agent, identifier))
         
         row = cursor.fetchone()
         
@@ -187,7 +226,6 @@ def get_or_create_session(token: str, ip_address: str, user_agent: str, user_ide
             return session_id
 
     # Create new session if not found
-    identifier = user_identifier or f"user_unknown"
     return create_session(identifier, ip_address, user_agent, token_type)
 
 def track_request(
@@ -584,6 +622,407 @@ def clear_missing_items(item_type: Optional[str] = None):
                 print("Cleared all missing items")
     except Exception as e:
         print(f"Error clearing missing items: {e}")
+
+
+# ─── Token Helpers ───────────────────────────────────────────────────────────
+
+def _hash_token(raw_token: str) -> str:
+    """Return SHA-256 hex digest of the raw token string."""
+    return hashlib.sha256(raw_token.encode()).hexdigest()
+
+
+def _mask_token(raw_token: str) -> str:
+    """Return a safely displayable masked version of a token."""
+    if len(raw_token) <= 12:
+        return raw_token[:4] + '****'
+    return raw_token[:8] + '...' + raw_token[-4:]
+
+
+# ─── Token Store ──────────────────────────────────────────────────────────────
+
+def seed_env_tokens(admin_token: Optional[str], user_token: Optional[str]) -> None:
+    """
+    Seed environment-variable tokens into the managed token store on startup.
+    Idempotent — already-present tokens (matched by hash) are skipped.
+    """
+    now = datetime.now().isoformat()
+    seeds = []
+    if admin_token:
+        seeds.append((admin_token, 'admin', 'Env: Admin Token'))
+    if user_token:
+        seeds.append((user_token, 'user', 'Env: User Token'))
+    try:
+        with get_db_connection() as conn:
+            for raw, role, name in seeds:
+                token_hash = _hash_token(raw)
+                existing = conn.execute(
+                    'SELECT token_id FROM tokens WHERE token_hash = ?', (token_hash,)
+                ).fetchone()
+                if existing:
+                    continue
+                token_id = str(uuid.uuid4())
+                masked = _mask_token(raw)
+                conn.execute('''
+                INSERT INTO tokens (token_id, token_hash, token_masked, name, owner, role,
+                                   created_at, status, notes)
+                VALUES (?, ?, ?, ?, 'system', ?, ?, 'active', 'Seeded from environment variable')
+                ''', (token_id, token_hash, masked, name, role, now))
+    except Exception as e:
+        print(f"Error seeding env tokens: {e}")
+
+
+def create_managed_token(
+    name: str,
+    owner: Optional[str] = None,
+    role: str = 'user',
+    notes: Optional[str] = None,
+    expires_at: Optional[str] = None,
+    actor: str = 'admin',
+    ip_address: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Create a new managed API token.
+    Returns the raw token once — it is not stored in plaintext anywhere after this call.
+    """
+    raw_token = _secrets.token_urlsafe(32)
+    token_id = str(uuid.uuid4())
+    token_hash = _hash_token(raw_token)
+    masked = _mask_token(raw_token)
+    now = datetime.now().isoformat()
+
+    with get_db_connection() as conn:
+        conn.execute('''
+        INSERT INTO tokens (token_id, token_hash, token_masked, name, owner, role,
+                           created_at, status, expires_at, notes)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)
+        ''', (token_id, token_hash, masked, name, owner, role, now, expires_at, notes))
+        conn.execute('''
+        INSERT INTO token_audit (token_id, token_masked, action, actor, timestamp, ip_address, reason)
+        VALUES (?, ?, 'created', ?, ?, ?, ?)
+        ''', (token_id, masked, actor, now, ip_address, f'Token "{name}" created'))
+
+    return {
+        'token_id': token_id,
+        'raw_token': raw_token,
+        'token_masked': masked,
+        'name': name,
+        'owner': owner,
+        'role': role,
+        'created_at': now,
+        'status': 'active',
+        'expires_at': expires_at,
+        'notes': notes,
+    }
+
+
+def get_all_tokens() -> List[Dict[str, Any]]:
+    """Return all managed tokens (masked — raw token never returned after creation)."""
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.execute('''
+            SELECT token_id, token_masked, name, owner, role, created_at,
+                   last_used, last_ip, status, expires_at, notes
+            FROM tokens
+            ORDER BY created_at DESC
+            ''')
+            return [dict(row) for row in cursor.fetchall()]
+    except Exception as e:
+        print(f"Error fetching tokens: {e}")
+        return []
+
+
+def get_token_audit(token_id: Optional[str] = None, limit: int = 100) -> List[Dict[str, Any]]:
+    """Return audit log entries, optionally filtered to a single token."""
+    try:
+        with get_db_connection() as conn:
+            if token_id:
+                cursor = conn.execute(
+                    'SELECT * FROM token_audit WHERE token_id = ? ORDER BY timestamp DESC LIMIT ?',
+                    (token_id, limit)
+                )
+            else:
+                cursor = conn.execute(
+                    'SELECT * FROM token_audit ORDER BY timestamp DESC LIMIT ?', (limit,)
+                )
+            return [dict(row) for row in cursor.fetchall()]
+    except Exception as e:
+        print(f"Error fetching token audit: {e}")
+        return []
+
+
+def revoke_token(
+    token_id: str,
+    actor: str = 'admin',
+    reason: Optional[str] = None,
+    ip_address: Optional[str] = None
+) -> bool:
+    """Revoke an active managed token. Returns True on success."""
+    try:
+        now = datetime.now().isoformat()
+        with get_db_connection() as conn:
+            row = conn.execute(
+                'SELECT token_masked, status FROM tokens WHERE token_id = ?', (token_id,)
+            ).fetchone()
+            if not row:
+                return False
+            if row['status'] == 'revoked':
+                return True
+            conn.execute(
+                "UPDATE tokens SET status = 'revoked' WHERE token_id = ?", (token_id,)
+            )
+            conn.execute('''
+            INSERT INTO token_audit (token_id, token_masked, action, actor, timestamp, ip_address, reason)
+            VALUES (?, ?, 'revoked', ?, ?, ?, ?)
+            ''', (token_id, row['token_masked'], actor, now, ip_address, reason or 'Token revoked'))
+        return True
+    except Exception as e:
+        print(f"Error revoking token: {e}")
+        return False
+
+
+def rotate_token(
+    token_id: str,
+    actor: str = 'admin',
+    reason: Optional[str] = None,
+    ip_address: Optional[str] = None
+) -> Optional[Dict[str, Any]]:
+    """
+    Rotate a token: revoke the old one and create a replacement with the same metadata.
+    Returns new token info (including raw_token, returned once only).
+    """
+    try:
+        with get_db_connection() as conn:
+            row = conn.execute('''
+            SELECT token_id, token_masked, name, owner, role, expires_at, notes
+            FROM tokens WHERE token_id = ?
+            ''', (token_id,)).fetchone()
+            if not row:
+                return None
+            old_masked = row['token_masked']
+            meta = dict(row)
+
+        now = datetime.now().isoformat()
+        with get_db_connection() as conn:
+            conn.execute(
+                "UPDATE tokens SET status = 'revoked' WHERE token_id = ?", (token_id,)
+            )
+            conn.execute('''
+            INSERT INTO token_audit (token_id, token_masked, action, actor, timestamp, ip_address, reason)
+            VALUES (?, ?, 'rotated_out', ?, ?, ?, ?)
+            ''', (token_id, old_masked, actor, now, ip_address,
+                  reason or 'Token rotated — old token revoked'))
+
+        return create_managed_token(
+            name=meta['name'],
+            owner=meta['owner'],
+            role=meta['role'],
+            notes=meta['notes'],
+            expires_at=meta['expires_at'],
+            actor=actor,
+            ip_address=ip_address,
+        )
+    except Exception as e:
+        print(f"Error rotating token: {e}")
+        return None
+
+
+def verify_db_token(raw_token: str) -> Optional[Dict[str, Any]]:
+    """
+    Check a raw token against the managed token store.
+    Returns the token row if active and not expired, else None.
+    """
+    try:
+        token_hash = _hash_token(raw_token)
+        with get_db_connection() as conn:
+            row = conn.execute('''
+            SELECT token_id, token_masked, name, owner, role,
+                   created_at, last_used, last_ip, status, expires_at, notes
+            FROM tokens WHERE token_hash = ? AND status = 'active'
+            ''', (token_hash,)).fetchone()
+            if not row:
+                return None
+            row_dict = dict(row)
+            if row_dict.get('expires_at'):
+                try:
+                    if datetime.now() > datetime.fromisoformat(row_dict['expires_at']):
+                        return None
+                except ValueError:
+                    # Malformed expiry date — treat as expired (fail-safe, never fail-open)
+                    print(f"Warning: token {row_dict.get('token_masked')!r} has malformed expires_at: {row_dict['expires_at']!r} — treating as expired")
+                    return None
+            return row_dict
+    except Exception as e:
+        print(f"Error verifying DB token: {e}")
+        return None
+
+
+def is_admin_db_token(raw_token: str) -> bool:
+    """Return True if this token is an active admin token in the DB store."""
+    row = verify_db_token(raw_token)
+    return row is not None and row.get('role') == 'admin'
+
+
+def log_token_use(raw_token: str, ip_address: str) -> None:
+    """Update last_used and last_ip for a token (best-effort, non-blocking)."""
+    try:
+        token_hash = _hash_token(raw_token)
+        now = datetime.now().isoformat()
+        with get_db_connection() as conn:
+            conn.execute(
+                'UPDATE tokens SET last_used = ?, last_ip = ? WHERE token_hash = ?',
+                (now, ip_address, token_hash)
+            )
+    except Exception:
+        pass
+
+
+# ─── Analytics Functions ───────────────────────────────────────────────────────
+
+def get_failure_analytics(hours: int = 24) -> Dict[str, Any]:
+    """Return failure counts grouped by endpoint and HTTP status code (>= 400)."""
+    from datetime import timedelta
+    try:
+        cutoff = (datetime.now() - timedelta(hours=hours)).isoformat()
+        with get_db_connection() as conn:
+            cursor = conn.execute('''
+            SELECT path, response_status, COUNT(*) as count
+            FROM requests
+            WHERE response_status >= 400
+              AND timestamp >= ?
+            GROUP BY path, response_status
+            ORDER BY count DESC
+            ''', (cutoff,))
+            rows = [dict(r) for r in cursor.fetchall()]
+
+        by_status: Dict[int, int] = {}
+        by_path: Dict[str, int] = {}
+        for r in rows:
+            by_status[r['response_status']] = by_status.get(r['response_status'], 0) + r['count']
+            by_path[r['path']] = by_path.get(r['path'], 0) + r['count']
+
+        return {
+            'hours': hours,
+            'by_endpoint_status': rows,
+            'by_status_code': [{'status': k, 'count': v} for k, v in sorted(by_status.items())],
+            'by_path': [{'path': k, 'count': v} for k, v in sorted(by_path.items(), key=lambda x: -x[1])],
+        }
+    except Exception as e:
+        print(f"Error in failure analytics: {e}")
+        return {'hours': hours, 'by_endpoint_status': [], 'by_status_code': [], 'by_path': [], 'error': str(e)}
+
+
+def get_top_failing_signatures(limit: int = 20, hours: int = 24) -> List[Dict[str, Any]]:
+    """Return the top failing request signatures (path + query fingerprint + status)."""
+    from datetime import timedelta
+    try:
+        cutoff = (datetime.now() - timedelta(hours=hours)).isoformat()
+        with get_db_connection() as conn:
+            cursor = conn.execute('''
+            SELECT path, query_params, response_status,
+                   COUNT(*) as count,
+                   MAX(timestamp) as last_seen,
+                   MIN(timestamp) as first_seen
+            FROM requests
+            WHERE response_status >= 400
+              AND timestamp >= ?
+            GROUP BY path, query_params, response_status
+            ORDER BY count DESC
+            LIMIT ?
+            ''', (cutoff, limit))
+            results = []
+            for row in cursor.fetchall():
+                d = dict(row)
+                try:
+                    d['query_params'] = json.loads(d['query_params'])
+                except Exception:
+                    d['query_params'] = {}
+                results.append(d)
+            return results
+    except Exception as e:
+        print(f"Error in top failing signatures: {e}")
+        return []
+
+
+def get_latency_stats(hours: int = 24) -> List[Dict[str, Any]]:
+    """
+    Return latency statistics (min, avg, p50, p95, p99, max) per endpoint.
+    Percentiles are computed in Python since SQLite has no native percentile function.
+    """
+    from datetime import timedelta
+    from collections import defaultdict as _dd
+    try:
+        cutoff = (datetime.now() - timedelta(hours=hours)).isoformat()
+        with get_db_connection() as conn:
+            cursor = conn.execute('''
+            SELECT path, response_time_ms
+            FROM requests
+            WHERE response_time_ms IS NOT NULL
+              AND timestamp >= ?
+            ORDER BY path
+            ''', (cutoff,))
+            rows = cursor.fetchall()
+
+        path_times: Dict[str, List[float]] = _dd(list)
+        for row in rows:
+            path_times[row['path']].append(row['response_time_ms'])
+
+        results = []
+        for path, times in sorted(path_times.items()):
+            times.sort()
+            n = len(times)
+
+            def pct(p: float) -> float:
+                idx = max(0, int(p / 100 * (n - 1)))
+                return round(times[idx], 2)
+
+            results.append({
+                'path': path,
+                'count': n,
+                'min_ms': round(times[0], 2),
+                'avg_ms': round(sum(times) / n, 2),
+                'p50_ms': pct(50),
+                'p95_ms': pct(95),
+                'p99_ms': pct(99),
+                'max_ms': round(times[-1], 2),
+            })
+        return results
+    except Exception as e:
+        print(f"Error in latency stats: {e}")
+        return []
+
+
+def get_request_trends(hours: int = 24) -> List[Dict[str, Any]]:
+    """Return request volume bucketed by hour for trend visualization."""
+    from datetime import timedelta
+    from collections import defaultdict as _dd
+    try:
+        cutoff = (datetime.now() - timedelta(hours=hours)).isoformat()
+        with get_db_connection() as conn:
+            cursor = conn.execute('''
+            SELECT strftime('%Y-%m-%dT%H:00:00', timestamp) as bucket,
+                   response_status,
+                   COUNT(*) as count
+            FROM requests
+            WHERE timestamp >= ?
+            GROUP BY bucket, response_status
+            ORDER BY bucket ASC
+            ''', (cutoff,))
+            rows = [dict(r) for r in cursor.fetchall()]
+
+        buckets: Dict[str, Dict[str, int]] = _dd(lambda: {'total': 0, 'errors': 0, 'success': 0})
+        for r in rows:
+            b = r['bucket']
+            c = r['count']
+            buckets[b]['total'] += c
+            if r['response_status'] is not None and r['response_status'] >= 400:
+                buckets[b]['errors'] += c
+            else:
+                buckets[b]['success'] += c
+
+        return [{'bucket': k, **v} for k, v in sorted(buckets.items())]
+    except Exception as e:
+        print(f"Error in request trends: {e}")
+        return []
 
 
 # Initialize tracking on module import

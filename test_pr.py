@@ -12,6 +12,8 @@ Coverage:
   - Admin-only endpoints reject non-admin tokens
   - Key endpoints return sane HTTP status codes (not 500)
   - Request body validation (400 on bad input, not 500)
+  - Token management endpoints (create, list, revoke, rotate, audit)
+  - Analytics endpoints (failures, latency, signatures, trends)
 """
 
 import os
@@ -597,6 +599,17 @@ KNOWN_ENDPOINTS = {
     ("POST",   "/admin/dashboard/login"),
     ("GET",    "/docs"),
     ("GET",    "/openapi.json"),
+    # Token management
+    ("GET",    "/admin/tokens"),
+    ("POST",   "/admin/tokens"),
+    ("PUT",    "/admin/tokens/{token_id}/revoke"),
+    ("POST",   "/admin/tokens/{token_id}/rotate"),
+    ("GET",    "/admin/tokens/audit"),
+    # Analytics
+    ("GET",    "/admin/analytics/failures"),
+    ("GET",    "/admin/analytics/latency"),
+    ("GET",    "/admin/analytics/signatures"),
+    ("GET",    "/admin/analytics/trends"),
 }
 
 KNOWN_CACHE_DB_FUNCTIONS = {
@@ -620,6 +633,13 @@ KNOWN_REQUEST_TRACKING_FUNCTIONS = {
     "get_request_logs", "get_session_summary", "get_session_details",
     "clear_old_sessions", "track_missing_item", "get_missing_items",
     "clear_missing_items",
+    # Token management
+    "_hash_token", "_mask_token", "seed_env_tokens", "create_managed_token",
+    "get_all_tokens", "revoke_token", "rotate_token", "verify_db_token",
+    "is_admin_db_token", "log_token_use", "get_token_audit",
+    # Analytics
+    "get_failure_analytics", "get_latency_stats",
+    "get_top_failing_signatures", "get_request_trends",
 }
 
 KNOWN_DEPLOY_SH_VARS = {
@@ -651,6 +671,117 @@ def _scan_deploy_vars(filepath: str) -> set:
     """Extract all UPPER_CASE variable assignments from deploy.sh."""
     content = Path(filepath).read_text(encoding="utf-8")
     return {m.group(1) for m in re.finditer(r'^([A-Z_][A-Z0-9_]+)\s*=', content, re.MULTILINE)}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Token management endpoints
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestTokenManagement:
+    def test_list_tokens_rejects_no_token(self):
+        r = CLIENT.get("/admin/tokens")
+        assert r.status_code in (401, 403)
+
+    def test_list_tokens_rejects_user_token(self):
+        r = CLIENT.get("/admin/tokens", headers=user_headers())
+        assert r.status_code in (401, 403)
+
+    def test_list_tokens_accepts_admin_does_not_crash(self):
+        r = CLIENT.get("/admin/tokens", headers=admin_headers())
+        assert r.status_code not in (401, 403, 500), f"Unexpected: {r.status_code} {r.text[:200]}"
+
+    def test_list_tokens_response_is_json(self):
+        r = CLIENT.get("/admin/tokens", headers=admin_headers())
+        if r.status_code == 200:
+            try:
+                r.json()
+            except Exception:
+                pytest.fail("Response was not valid JSON")
+
+    def test_create_token_rejects_user_token(self):
+        r = CLIENT.post("/admin/tokens", json={"name": "t", "role": "user"}, headers=user_headers())
+        assert r.status_code in (401, 403)
+
+    def test_create_token_missing_name_returns_422(self):
+        r = CLIENT.post("/admin/tokens", json={"role": "user"}, headers=admin_headers())
+        assert r.status_code == 422
+
+    def test_create_token_invalid_role_returns_422(self):
+        r = CLIENT.post("/admin/tokens", json={"name": "pr-test", "role": "superuser"}, headers=admin_headers())
+        assert r.status_code == 422
+
+    def test_create_token_bad_expires_at_returns_422(self):
+        r = CLIENT.post("/admin/tokens", json={"name": "pr-test", "role": "user", "expires_at": "NOT-A-DATE"}, headers=admin_headers())
+        assert r.status_code == 422
+
+    def test_create_and_revoke_lifecycle(self):
+        """Create a token then immediately revoke it — verifies full lifecycle."""
+        r = CLIENT.post("/admin/tokens", json={"name": "pr-lifecycle-test", "role": "user"}, headers=admin_headers())
+        assert r.status_code == 200, f"Create failed: {r.status_code} {r.text[:200]}"
+        data = r.json()
+        token_id = data.get("token_id")
+        assert token_id, "No token_id in response"
+        # Revoke it
+        rv = CLIENT.put(f"/admin/tokens/{token_id}/revoke", json={"reason": "pr test cleanup"}, headers=admin_headers())
+        assert rv.status_code == 200, f"Revoke failed: {rv.status_code}"
+
+    def test_revoke_nonexistent_token_returns_404(self):
+        r = CLIENT.put("/admin/tokens/99999999/revoke", json={"reason": "test"}, headers=admin_headers())
+        assert r.status_code == 404
+
+    def test_revoke_rejects_user_token(self):
+        r = CLIENT.put("/admin/tokens/1/revoke", json={"reason": "test"}, headers=user_headers())
+        assert r.status_code in (401, 403)
+
+    def test_rotate_rejects_user_token(self):
+        r = CLIENT.post("/admin/tokens/1/rotate", headers=user_headers())
+        assert r.status_code in (401, 403)
+
+    def test_audit_log_rejects_user_token(self):
+        r = CLIENT.get("/admin/tokens/audit", headers=user_headers())
+        assert r.status_code in (401, 403)
+
+    def test_audit_log_accepts_admin_does_not_crash(self):
+        r = CLIENT.get("/admin/tokens/audit", headers=admin_headers())
+        assert r.status_code not in (401, 403, 500), f"Unexpected: {r.status_code} {r.text[:200]}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Analytics endpoints
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestAnalyticsEndpoints:
+    def test_failures_rejects_user_token(self):
+        r = CLIENT.get("/admin/analytics/failures", headers=user_headers())
+        assert r.status_code in (401, 403)
+
+    def test_failures_accepts_admin_does_not_crash(self):
+        r = CLIENT.get("/admin/analytics/failures", headers=admin_headers())
+        assert r.status_code not in (401, 403, 500), f"Unexpected: {r.status_code} {r.text[:200]}"
+
+    def test_latency_rejects_user_token(self):
+        r = CLIENT.get("/admin/analytics/latency", headers=user_headers())
+        assert r.status_code in (401, 403)
+
+    def test_latency_accepts_admin_does_not_crash(self):
+        r = CLIENT.get("/admin/analytics/latency", headers=admin_headers())
+        assert r.status_code not in (401, 403, 500), f"Unexpected: {r.status_code} {r.text[:200]}"
+
+    def test_signatures_rejects_user_token(self):
+        r = CLIENT.get("/admin/analytics/signatures", headers=user_headers())
+        assert r.status_code in (401, 403)
+
+    def test_signatures_accepts_admin_does_not_crash(self):
+        r = CLIENT.get("/admin/analytics/signatures", headers=admin_headers())
+        assert r.status_code not in (401, 403, 500), f"Unexpected: {r.status_code} {r.text[:200]}"
+
+    def test_trends_rejects_user_token(self):
+        r = CLIENT.get("/admin/analytics/trends", headers=user_headers())
+        assert r.status_code in (401, 403)
+
+    def test_trends_accepts_admin_does_not_crash(self):
+        r = CLIENT.get("/admin/analytics/trends", headers=admin_headers())
+        assert r.status_code not in (401, 403, 500), f"Unexpected: {r.status_code} {r.text[:200]}"
 
 
 class TestSourceFileCoverage:
