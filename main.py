@@ -259,6 +259,7 @@ async def startup_containers():
 # Mount static files for dashboard
 app.mount("/admin/js", StaticFiles(directory="js"), name="admin_js")
 app.mount("/admin/css", StaticFiles(directory="css"), name="admin_css")
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
 @app.get("/admin/dashboard", tags=["admin"])
 async def serve_dashboard():

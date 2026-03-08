@@ -399,8 +399,23 @@ def get_cache_entry(
                         ORDER BY p.name
                     """, (team_id,))
                     
-                    players = [dict(row) for row in cursor.fetchall()]
-                    
+                    player_rows = cursor.fetchall()
+                    team_filename = result["name"].replace(" ", "_")
+                    sport_lower = (result["sport_name"] or "").lower()
+                    league_lower = (result["league_name"] or "").lower()
+                    team_folder = result["name"].replace(" ", "_").lower()
+
+                    players = []
+                    for p_row in player_rows:
+                        p_dict = dict(p_row)
+                        player_filename = (p_row["name"] or "").replace(" ", "_").lower()
+                        p_logo_path = os.path.join(os.path.dirname(__file__), "static", "logo", "players", sport_lower, league_lower, team_folder, f"{player_filename}.png")
+                        p_dict["logo_url"] = f"/static/logo/players/{sport_lower}/{league_lower}/{team_folder}/{player_filename}.png" if os.path.exists(p_logo_path) else None
+                        players.append(p_dict)
+
+                    logo_path = os.path.join(os.path.dirname(__file__), "static", "logo", "teams", sport_lower, league_lower, f"{team_filename}.png")
+                    logo_url = f"/static/logo/teams/{sport_lower}/{league_lower}/{team_filename}.png" if os.path.exists(logo_path) else None
+
                     teams_data.append({
                         "id": result["id"],
                         "normalized_name": result["name"],
@@ -410,6 +425,7 @@ def get_cache_entry(
                         "nickname": result["nickname"],
                         "league": result["league_name"],
                         "sport": result["sport_name"],
+                        "logo_url": logo_url,
                         "players": players,
                         "player_count": len(players)
                     })
@@ -598,8 +614,18 @@ def get_cache_entry(
                         ORDER BY t.name
                     """, (league_id,))
                     
-                    teams = [dict(row) for row in cursor.fetchall()]
-                    
+                    team_rows = cursor.fetchall()
+                    sport_lower = (result["sport_name"] or "").lower()
+                    league_lower = (result["name"] or "").lower()
+
+                    teams = []
+                    for t_row in team_rows:
+                        t_dict = dict(t_row)
+                        team_filename = (t_row["name"] or "").replace(" ", "_")
+                        t_logo_path = os.path.join(os.path.dirname(__file__), "static", "logo", "teams", sport_lower, league_lower, f"{team_filename}.png")
+                        t_dict["logo_url"] = f"/static/logo/teams/{sport_lower}/{league_lower}/{team_filename}.png" if os.path.exists(t_logo_path) else None
+                        teams.append(t_dict)
+
                     leagues_data.append({
                         "id": result["id"],
                         "normalized_name": result["name"],
@@ -1386,7 +1412,8 @@ def get_all_leagues(
                 s.name as sport_name,
                 l.region,
                 l.region_code,
-                l.gender
+                l.gender,
+                l.logo
             FROM leagues l
             LEFT JOIN sports s ON l.sport_id = s.id
             WHERE 1=1
@@ -1423,7 +1450,8 @@ def get_all_leagues(
                 "sport_name": row["sport_name"],
                 "region": row["region"],
                 "region_code": row["region_code"],
-                "gender": row["gender"]
+                "gender": row["gender"],
+                "logo": row["logo"]
             }
             
             # Get aliases for this league
