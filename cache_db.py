@@ -6,6 +6,7 @@ Provides database access to sports data using SQLite with Redis caching.
 import sqlite3
 import os
 import time
+from itertools import permutations as _permutations
 from typing import Optional, Dict, Any, List
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -626,102 +627,162 @@ def get_cache_entry(
             normalized_market = normalize_key(market)
             # Create a stripped version for robust matching (no spaces, no underscores)
             market_search_term = market.lower().replace(" ", "").replace("_", "")
-            
-            # First, try exact alias match (normalized)
+
+            market_ids = []   # resolved market IDs (one or more)
+            is_exact = False  # True when resolved via an exact alias or name match
+
+            # Step 1: Try exact alias match
             cursor.execute("""
                 SELECT DISTINCT market_id FROM market_aliases
                 WHERE LOWER(REPLACE(REPLACE(alias, ' ', ''), '_', '')) = ?
                 LIMIT 1
             """, (market_search_term,))
-            
             alias_result = cursor.fetchone()
-            
+
             if alias_result:
-                market_id = alias_result[0]
+                market_ids = [alias_result[0]]
+                is_exact = True
             else:
-                # No exact alias match, try direct match on markets table
-                # 1. Try exact stripped match
+                # Step 2: Try exact stripped match on markets table
                 cursor.execute("""
                     SELECT id FROM markets
                     WHERE LOWER(REPLACE(REPLACE(name, ' ', ''), '_', '')) = ?
                     LIMIT 1
                 """, (market_search_term,))
                 direct_result = cursor.fetchone()
-                
+
                 if direct_result:
-                    market_id = direct_result[0]
+                    market_ids = [direct_result[0]]
+                    is_exact = True
                 else:
-                    # 2. Try fuzzy contain match (e.g. "Completion Percentage" -> "Player Passing Completion Percentage")
-                    # We normalize the input first to ensure good matching
+                    # Step 3: Fuzzy prefix match — collect ALL matches, not just the first
                     normalized_input = market.lower().strip()
-                    
-                    # Search 2a: Direct fuzzy on input (Prefix first)
+
                     cursor.execute("""
                         SELECT id FROM markets
-                        WHERE name LIKE ?
-                        ORDER BY LENGTH(name) ASC 
-                        LIMIT 1
+                        WHERE LOWER(name) LIKE ?
+                        ORDER BY LENGTH(name) ASC, name ASC
                     """, (f"{normalized_input}%",))
-                    fuzzy_result = cursor.fetchone()
-                    
-                    if not fuzzy_result and len(normalized_input) > 3:
-                        # STRICT PERFORMANCE MODE: Disabled full wildcard scan for markets
-                        pass
+                    fuzzy_rows = cursor.fetchall()
 
-                    if fuzzy_result:
-                         market_id = fuzzy_result[0]
+                    if fuzzy_rows:
+                        market_ids = [row[0] for row in fuzzy_rows]
                     else:
-                        # Search 2b: Expanded abbreviations (Rush -> Rushing, etc)
+                        # Step 4: Expanded abbreviations (1h -> 1st half, yds -> yards, etc.)
                         expanded_input = expand_sports_terms(normalized_input)
                         if expanded_input != normalized_input:
                             cursor.execute("""
                                 SELECT id FROM markets
-                                WHERE name LIKE ?
-                                ORDER BY LENGTH(name) ASC
-                                LIMIT 1
-                            """, (f"{expanded_input}%",))
-                            expanded_result = cursor.fetchone()
-                            
-                            if not expanded_result and len(expanded_input) > 3:
-                                # STRICT PERFORMANCE MODE: Disabled full wildcard scan for markets
-                                pass
-
-                            if expanded_result:
-                                market_id = expanded_result[0]
+                                WHERE LOWER(name) LIKE ?
+                                ORDER BY LENGTH(name) ASC, name ASC
+                            """, (f"{expanded_input.replace('_', ' ')}%",))
+                            expanded_rows = cursor.fetchall()
+                            if expanded_rows:
+                                market_ids = [row[0] for row in expanded_rows]
                             else:
                                 return None
                         else:
                             return None
-            
-            # Search for market by resolved ID
-            cursor.execute("""
-                SELECT m.id, m.name, m.market_type_id
-                FROM markets m
-                WHERE m.id = ?
-            """, (market_id,))
-            
-            result = cursor.fetchone()
-            if result:
-                # Get associated sports for this market
-                cursor.execute("""
-                    SELECT s.name
+
+            if not market_ids:
+                return None
+
+            # When we resolved to exactly one market via an exact match, check whether
+            # its normalized_name is itself an abbreviated/internal name (e.g. "total_1h").
+            # If so, expand it and return all matching canonical markets instead.
+            if is_exact and len(market_ids) == 1:
+                cursor.execute("SELECT name FROM markets WHERE id = ?", (market_ids[0],))
+                name_row = cursor.fetchone()
+                if name_row:
+                    matched_name = name_row[0]
+                    if expand_sports_terms(matched_name.lower()) != matched_name.lower():
+                        # Internal abbreviated name detected (e.g. "total_1h", "money_1h").
+                        # Split on "_", expand each token, then try every token ordering as a
+                        # prefix search.  This maps "total_1h" -> "1st half total%" precisely.
+                        parts = matched_name.lower().split("_")
+                        expanded_parts = [expand_sports_terms(p).strip() for p in parts]
+                        canonical_ids: List[str] = []
+                        if len(expanded_parts) <= 4:  # cap permutations (max 4! = 24)
+                            seen: set = set()
+                            for perm in _permutations(expanded_parts):
+                                prefix = " ".join(perm)
+                                cursor.execute(
+                                    "SELECT id FROM markets WHERE LOWER(name) LIKE ? ORDER BY name",
+                                    (f"{prefix}%",)
+                                )
+                                for row in cursor.fetchall():
+                                    if row[0] not in seen:
+                                        seen.add(row[0])
+                                        canonical_ids.append(row[0])
+                        if not canonical_ids:
+                            # Fall back: keyword-contains search across all expanded tokens
+                            keywords = [kw for kw in " ".join(expanded_parts).split() if len(kw) > 1]
+                            where_parts = " AND ".join(["LOWER(name) LIKE ?" for _ in keywords])
+                            params = [f"%{kw}%" for kw in keywords]
+                            cursor.execute(
+                                f"SELECT id FROM markets WHERE {where_parts} ORDER BY name",
+                                params
+                            )
+                            canonical_ids = [row[0] for row in cursor.fetchall()]
+                        if canonical_ids:
+                            market_ids = canonical_ids
+                            is_exact = False  # now treated as multi-match
+
+            # Fetch full details for all resolved market IDs
+            placeholders = ",".join("?" * len(market_ids))
+            cursor.execute(
+                f"SELECT id, name, market_type_id FROM markets WHERE id IN ({placeholders}) ORDER BY name",
+                market_ids
+            )
+            market_rows = cursor.fetchall()
+
+            if not market_rows:
+                return None
+
+            # Fetch sports for all resolved markets in one query
+            cursor.execute(
+                f"""SELECT ms.market_id, s.name
                     FROM market_sports ms
                     JOIN sports s ON ms.sport_id = s.id
-                    WHERE ms.market_id = ?
-                """, (result["id"],))
-                sports = [row["name"] for row in cursor.fetchall()]
-                
+                    WHERE ms.market_id IN ({placeholders})""",
+                market_ids
+            )
+            sports_map: Dict[str, List[str]] = {}
+            for row in cursor.fetchall():
+                mid = row[0]
+                if mid not in sports_map:
+                    sports_map[mid] = []
+                sports_map[mid].append(row[1])
+
+            if len(market_rows) == 1:
+                # Single result — return existing single-market format (backward compatible)
+                result = market_rows[0]
                 result_data = {
                     "type": "market",
                     "query": market,
                     "normalized_name": result["name"],
                     "market_type_id": result["market_type_id"],
-                    "sports": sports
+                    "sports": sports_map.get(result["id"], [])
                 }
-                
-                # Cache the result
                 set_cached_data(result_data, market=market, team=team, player=player, sport=sport)
                 return result_data
+
+            # Multiple results — return all canonical matches
+            matches = [
+                {
+                    "normalized_name": row["name"],
+                    "market_type_id": row["market_type_id"],
+                    "sports": sports_map.get(row["id"], [])
+                }
+                for row in market_rows
+            ]
+            result_data = {
+                "type": "market",
+                "query": market,
+                "matches": matches
+            }
+            set_cached_data(result_data, market=market, team=team, player=player, sport=sport)
+            return result_data
         
         # No match found
         return None
@@ -1090,100 +1151,170 @@ def _resolve_batch_players(conn: sqlite3.Connection, player_names: List[str]) ->
 def _resolve_bulk_markets(conn: sqlite3.Connection, market_names: List[str]) -> Dict[str, Any]:
     """Bulk resolve markets by loading all markets in memory (small dataset)"""
     results = {}
-    
-    # Load ALL markets (ID, name)
-    # This is much faster than 50 LIKE queries
-    cursor = conn.execute("SELECT id, name FROM markets")
-    all_markets = cursor.fetchall() # List of Row
-    
-    # Create helper maps
-    # 1. Exact Name Map
-    # 2. Stripped Name Map
-    exact_map = {m["name"].lower(): m["id"] for m in all_markets}
+
+    # Load ALL markets (ID, name) — faster than many LIKE queries
+    cursor = conn.execute("SELECT id, name, market_type_id FROM markets")
+    all_markets = cursor.fetchall()
+
+    # Build lookup maps
+    exact_map    = {m["name"].lower(): m["id"] for m in all_markets}
     stripped_map = {m["name"].lower().replace(" ", "").replace("_", ""): m["id"] for m in all_markets}
-    
-    # 3. Check alias table
+    all_markets_lower = [(m["name"].lower(), m["id"], m["name"]) for m in all_markets]
+
+    # Alias table
     cursor = conn.execute("SELECT alias, market_id FROM market_aliases")
-    alias_rows = cursor.fetchall()
-    alias_map = {row["alias"].lower().replace(" ", "").replace("_", ""): row["market_id"] for row in alias_rows}
-    
-    # Process inputs
-    found_ids = {} # original -> id
-    
+    alias_map = {
+        row["alias"].lower().replace(" ", "").replace("_", ""): row["market_id"]
+        for row in cursor.fetchall()
+    }
+
+    # Resolve each market name:
+    #   found_single[original] = single market id  (exact match)
+    #   found_multi[original]  = list of market ids (fuzzy / ambiguous / abbreviation expansion)
+    found_single: Dict[str, str]       = {}
+    found_multi:  Dict[str, List[str]] = {}
+
     for original in market_names:
-        norm = original.lower().strip()
+        norm    = original.lower().strip()
         stripped = norm.replace(" ", "").replace("_", "")
-        
-        mid = None
-        
-        # 1. Alias Check
+
+        # 1. Exact alias match
         if stripped in alias_map:
-            mid = alias_map[stripped]
-        
-        # 2. Exact/Stripped Check in Main
-        if not mid:
-            if norm in exact_map:
-                mid = exact_map[norm]
-            elif stripped in stripped_map:
-                mid = stripped_map[stripped]
-                
-        # 3. Fuzzy Check (Prefix) - In Memory
-        if not mid:
-            # simple linear scan is fast for < 1000 items
-            for m in all_markets:
-                m_name = m["name"].lower()
-                if m_name.startswith(norm):
-                    mid = m["id"]
-                    break
-                    
-        if mid:
-            found_ids[original] = mid
-            
-    # Fetch details for found IDs
-    unique_mids = list(set(found_ids.values()))
-    market_data_map = {}
-    
-    if unique_mids:
-        placeholders = ','.join('?' * len(unique_mids))
-        cursor = conn.execute(f"SELECT id, name, market_type_id FROM markets WHERE id IN ({placeholders})", unique_mids)
-        rows = cursor.fetchall()
-        
-        # Fetch sports for these markets
-        # ONE-TO-MANY (Market -> Sports)
-        # SELECT market_id, sport_name ...
-        # Join optimization
-        cursor = conn.execute(f"""
-            SELECT ms.market_id, s.name 
-            FROM market_sports ms 
-            JOIN sports s ON ms.sport_id = s.id 
-            WHERE ms.market_id IN ({placeholders})
-        """, unique_mids)
-        sports_map = {}
+            found_single[original] = alias_map[stripped]
+            continue
+
+        # 2. Exact name / stripped-name match
+        if norm in exact_map:
+            found_single[original] = exact_map[norm]
+            continue
+        if stripped in stripped_map:
+            found_single[original] = stripped_map[stripped]
+            continue
+
+        # 3. Fuzzy prefix match — collect ALL matches
+        prefix_matches = [mid for (mname, mid, _) in all_markets_lower if mname.startswith(norm)]
+        if prefix_matches:
+            if len(prefix_matches) == 1:
+                found_single[original] = prefix_matches[0]
+            else:
+                found_multi[original] = prefix_matches
+            continue
+
+        # 4. Expanded abbreviation prefix match (e.g. "1h" -> "1st half")
+        expanded_norm = expand_sports_terms(norm).replace("_", " ")
+        if expanded_norm != norm:
+            exp_matches = [mid for (mname, mid, _) in all_markets_lower if mname.startswith(expanded_norm)]
+            if exp_matches:
+                if len(exp_matches) == 1:
+                    found_single[original] = exp_matches[0]
+                else:
+                    found_multi[original] = exp_matches
+
+    # For exact single matches, check if the resolved market name is itself an internal
+    # abbreviation (e.g. "total_1h", "money_1h").  If so, expand it and return all
+    # canonical markets that match instead.
+    for original, mid in list(found_single.items()):
+        matched_name = next((m["name"] for m in all_markets if m["id"] == mid), None)
+        if matched_name is None:
+            continue
+        if expand_sports_terms(matched_name.lower()) != matched_name.lower():
+            # Internal abbreviated name — split on "_", expand each token, then try every
+            # ordering as an in-memory prefix search.  E.g. "total_1h" -> ["total","1st half"]
+            # -> try "1st half total" prefix -> finds all "1st Half Total *" markets.
+            parts = matched_name.lower().split("_")
+            expanded_parts = [expand_sports_terms(p).strip() for p in parts]
+            canonical_ids: List[str] = []
+            if len(expanded_parts) <= 4:  # cap permutations (max 4! = 24)
+                seen: set = set()
+                for perm in _permutations(expanded_parts):
+                    prefix = " ".join(perm)
+                    for (mname, m_id, _) in all_markets_lower:
+                        if mname.startswith(prefix) and m_id not in seen:
+                            seen.add(m_id)
+                            canonical_ids.append(m_id)
+            if not canonical_ids:
+                # Fall back: keyword-contains across all expanded tokens
+                keywords = [kw for kw in " ".join(expanded_parts).split() if len(kw) > 1]
+                canonical_ids = [
+                    m["id"] for m in all_markets
+                    if all(kw in m["name"].lower() for kw in keywords)
+                ]
+            if canonical_ids:
+                del found_single[original]
+                found_multi[original] = canonical_ids
+
+    # Collect all IDs that need detail lookups
+    all_relevant_ids = list({mid for mid in found_single.values()} |
+                            {mid for mids in found_multi.values() for mid in mids})
+
+    market_detail_map: Dict[str, Dict] = {}
+    sports_map: Dict[str, List[str]]   = {}
+
+    if all_relevant_ids:
+        placeholders = ",".join("?" * len(all_relevant_ids))
+        cursor = conn.execute(
+            f"SELECT id, name, market_type_id FROM markets WHERE id IN ({placeholders})",
+            all_relevant_ids
+        )
+        for row in cursor.fetchall():
+            market_detail_map[row["id"]] = {
+                "normalized_name": row["name"],
+                "market_type_id":  row["market_type_id"],
+            }
+
+        cursor = conn.execute(
+            f"""SELECT ms.market_id, s.name
+                FROM market_sports ms
+                JOIN sports s ON ms.sport_id = s.id
+                WHERE ms.market_id IN ({placeholders})""",
+            all_relevant_ids
+        )
         for row in cursor:
             mid = row[0]
-            sname = row[1]
             if mid not in sports_map:
                 sports_map[mid] = []
-            sports_map[mid].append(sname)
-            
-        for row in rows:
-            mid = row["id"]
-            market_data_map[mid] = {
-                "type": "market",
-                "normalized_name": row["name"],
-                "market_type_id": row["market_type_id"],
-                "sports": sports_map.get(mid, [])
-            }
-            
-    # Map back
+            sports_map[mid].append(row[1])
+
+    # Build output
     for original in market_names:
-        if original in found_ids and found_ids[original] in market_data_map:
-            res = market_data_map[found_ids[original]].copy()
-            res["query"] = original
-            results[original] = res
+        if original in found_single:
+            mid = found_single[original]
+            if mid in market_detail_map:
+                detail = market_detail_map[mid]
+                results[original] = {
+                    "type":            "market",
+                    "query":           original,
+                    "normalized_name": detail["normalized_name"],
+                    "market_type_id":  detail["market_type_id"],
+                    "sports":          sports_map.get(mid, []),
+                }
+            else:
+                results[original] = None
+
+        elif original in found_multi:
+            mids = sorted(found_multi[original],
+                          key=lambda i: market_detail_map.get(i, {}).get("normalized_name", ""))
+            matches = [
+                {
+                    "normalized_name": market_detail_map[mid]["normalized_name"],
+                    "market_type_id":  market_detail_map[mid]["market_type_id"],
+                    "sports":          sports_map.get(mid, []),
+                }
+                for mid in mids
+                if mid in market_detail_map
+            ]
+            if matches:
+                results[original] = {
+                    "type":    "market",
+                    "query":   original,
+                    "matches": matches,
+                }
+            else:
+                results[original] = None
+
         else:
             results[original] = None
-            
+
     return results
 
 
