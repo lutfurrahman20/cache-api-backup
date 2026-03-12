@@ -627,10 +627,14 @@ def get_cache_entry(
                         t_dict["logo_url"] = f"/static/logo/teams/{sport_lower}/{league_lower}/{team_filename}.png" if os.path.exists(t_logo_path) else None
                         teams.append(t_dict)
 
+                    league_logo_path = os.path.join(os.path.dirname(__file__), "static", "logo", "leagues", sport_lower, f"{result['name']}.png")
+                    league_logo_url = f"/static/logo/leagues/{sport_lower}/{result['name']}.png" if os.path.exists(league_logo_path) else None
+
                     leagues_data.append({
                         "id": result["id"],
                         "normalized_name": result["name"],
                         "sport": result["sport_name"],
+                        "logo_url": league_logo_url,
                         "teams": teams,
                         "team_count": len(teams)
                     })
