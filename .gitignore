@@ -112,7 +112,7 @@ final_report.md
 final_report.pdf
 
 # ignore old database
-sports_data_old.db
+sports_data_backup.db
 
 # igonore all files named with "verify"
 *verify*
