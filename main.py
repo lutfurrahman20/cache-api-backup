@@ -415,9 +415,11 @@ class BatchQueryRequest(BaseModel):
 
     @model_validator(mode='after')
     def require_at_least_one_list(self):
-        if not any([self.team, self.player, self.market, self.league]):
+        # Reject only when ALL list fields are absent (None) — e.g. wrong schema
+        # like {"queries":[...]}. Empty lists [] are valid (returns empty result).
+        if all(v is None for v in [self.team, self.player, self.market, self.league]):
             raise ValueError(
-                "At least one of 'team', 'player', 'market', or 'league' must be provided with at least one value"
+                "At least one of 'team', 'player', 'market', or 'league' must be provided"
             )
         return self
 
