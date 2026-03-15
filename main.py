@@ -113,6 +113,13 @@ import json
 import request_tracking
 import uuid_tracking
 
+# Optional stats enrichment bridge — gracefully absent when not configured.
+# Import failure (e.g. httpx not installed) is caught so startup never breaks.
+try:
+    import sports_bridge as _sports_bridge
+except Exception:  # pragma: no cover
+    _sports_bridge = None  # type: ignore[assignment]
+
 # Load environment variables
 load_dotenv()
 
@@ -533,6 +540,7 @@ async def get_cache(
     player: Optional[str] = Query(None, description="Player name to look up"),
     sport: Optional[str] = Query(None, description="Sport name (required when searching by team or league)"),
     league: Optional[str] = Query(None, description="League name to look up"),
+    include_stats: bool = Query(False, description="Enrich response with historical/live stats (requires STATS_API_URL)"),
     token: str = Depends(verify_token),
     _: None = Depends(verify_rate_limit)
 ) -> JSONResponse:
@@ -648,20 +656,28 @@ async def get_cache(
                 }
             )
         
-        return JSONResponse(
-            status_code=200,
-            content={
-                "found": True,
-                "data": result,
-                "query": {
-                    "market": market,
-                    "team": team,
-                    "player": player,
-                    "sport": sport,
-                    "league": league
-                }
+        response_content: dict = {
+            "found": True,
+            "data": result,
+            "query": {
+                "market": market,
+                "team": team,
+                "player": player,
+                "sport": sport,
+                "league": league
             }
-        )
+        }
+
+        # Optional stats enrichment — never raises, never changes default behaviour
+        if include_stats and _sports_bridge is not None:
+            try:
+                stats_data = await _sports_bridge.enrich(player, team, sport)
+                if stats_data is not None:
+                    response_content["stats"] = stats_data
+            except Exception as _stats_exc:
+                print(f"[WARN] stats enrichment failed (non-critical): {_stats_exc}")
+
+        return JSONResponse(status_code=200, content=response_content)
         
     except Exception as e:
         print(f"[ERROR] GET /cache: {e}")

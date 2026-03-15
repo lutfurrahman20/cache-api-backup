@@ -6,5 +6,6 @@ redis
 hiredis
 python-dotenv
 requests
+httpx
 geoip2
 python-multipart

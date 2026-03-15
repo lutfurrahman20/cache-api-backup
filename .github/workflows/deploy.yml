@@ -33,7 +33,7 @@ jobs:
       - name: Check Python syntax (all files)
         run: |
           echo "=== Syntax check ==="
-          python -m py_compile main.py cache_db.py redis_cache.py request_tracking.py uuid_tracking.py
+          python -m py_compile main.py cache_db.py redis_cache.py sports_bridge.py request_tracking.py uuid_tracking.py
           echo "✅ All files passed syntax check"
 
       - name: Run automated PR tests

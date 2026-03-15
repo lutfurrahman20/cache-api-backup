@@ -14,6 +14,7 @@ FastAPI service for sports cache normalization with Redis-backed caching, batch 
 - Serves a browser-based admin dashboard (8 tabs: Overview, Sessions, API Tester, Server Logs, Missing Data, Tokens, Analytics, Settings)
 - Uses Redis for caching and SQLite for both lookup data and telemetry storage
 - Deploys to VPS through GitHub Actions + `deploy.sh` with fork-safety guards and retry logic
+- **Optional stats enrichment**: `GET /cache?include_stats=true` transparently fetches historical and live statistics from the internal `stats_api` service and merges them into the response — zero overhead when not configured
 
 ## Tech stack
 
@@ -31,6 +32,7 @@ FastAPI service for sports cache normalization with Redis-backed caching, batch 
 main.py               # FastAPI app, all routes, middleware, startup logic
 cache_db.py           # SQLite query layer (sports_data.db) with Redis cache integration
 redis_cache.py        # Redis client, cache key generation, stats, clear, invalidate
+sports_bridge.py      # Optional async enrichment bridge to the internal stats_api service
 request_tracking.py   # SQLite-backed request/session/missing-item tracking
 uuid_tracking.py      # UUID-based login tracking with geo-location via ip-api.com
 testing.py            # Full endpoint validation runner (local vs prod)
@@ -159,12 +161,13 @@ The MaxMind database file is required at `geoip/GeoLite2-City.mmdb`. If absent, 
 ### Authenticated (user or admin token)
 
 - `GET /cache`
-  - Query params: `market`, `team`, `player`, `sport`, `league`
+  - Query params: `market`, `team`, `player`, `sport`, `league`, `include_stats` (default `false`)
   - Validation:
     - at least one of `market|team|player|league` required
     - `sport` required for team-only searches
     - `sport` required for league searches
   - Returns `404` with `found: false` when no match; missing items are recorded automatically
+  - When `include_stats=true` and `STATS_API_URL` is configured, a `stats` key is merged into the `200` response with player/team historical stats and live state. Response shape is otherwise **identical** — existing callers are not affected
 - `POST /cache/batch`
   - Body fields: `team[]`, `player[]`, `market[]`, `sport`, `league[]`
   - Independent lookup per category; each item resolves separately
@@ -254,6 +257,15 @@ Core runtime variables:
 | `REDIS_PASSWORD`        | —           | Redis password (if required)                 |
 | `CACHE_TTL`             | `3600`      | Redis cache TTL in seconds                   |
 
+Stats API bridge variables (all optional — leave `STATS_API_URL` blank to disable enrichment entirely):
+
+| Variable            | Default | Description                                                                                    |
+| ------------------- | ------- | ---------------------------------------------------------------------------------------------- |
+| `STATS_API_URL`     | —       | Base URL of the internal stats service (e.g. `http://localhost:8001`). Leave blank to disable. |
+| `STATS_API_TOKEN`   | —       | Bearer token required by `stats_api.py` (optional if auth is disabled there)                   |
+| `STATS_API_TIMEOUT` | `1.0`   | Hard timeout in seconds for stats requests — protects production response time                 |
+| `STATS_CACHE_TTL`   | `300`   | Redis TTL for cached stat payloads in seconds                                                  |
+
 CI/CD smoke-test email alert variables (set as GitHub repository secrets):
 
 | Variable             | Description                                      |
@@ -272,6 +284,61 @@ Notes:
 
 - `main.py` runs Uvicorn on port `5000` when started directly.
 - On Windows without `REDIS_HOST` set, the app auto-discovers and starts any Docker Redis container at startup.
+
+## Stats API bridge
+
+`sports_bridge.py` is an optional async enrichment layer that connects this service to the internal `realtime_data_fetch/stats_api.py` service.
+
+### How it works
+
+1. A caller adds `?include_stats=true` to any `GET /cache` request.
+2. If `STATS_API_URL` is set, `sports_bridge.enrich(player, team, sport)` is called after the normal cache lookup succeeds.
+3. The bridge queries up to three stats endpoints — `/stats/player`, `/stats/team`, `/stats/live` — using the same identifiers already present in the request.
+4. Results are cached in Redis under `stats_bridge:*` keys (separate namespace, no collision with `cache:*` keys) with a configurable TTL (`STATS_CACHE_TTL`, default 5 min).
+5. The merged `stats` object is appended to the existing response. If the stats service is unavailable, the original response is returned unchanged.
+
+### Safety guarantees
+
+| Guarantee                       | Detail                                                                                                                                                       |
+| ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **Zero overhead when disabled** | If `STATS_API_URL` is not set, `enrich()` returns `None` immediately — no network activity, no latency                                                       |
+| **Hard timeout**                | `STATS_API_TIMEOUT` (default 1 s) caps every fetch — a slow stats service can never stall a production response                                              |
+| **Never raises**                | All exceptions (timeout, connection refused, JSON parse, Redis errors) are caught and logged at `DEBUG` level; the function returns `None`                   |
+| **Opt-in only**                 | `include_stats` defaults to `false` — all existing API callers see zero change                                                                               |
+| **Import-safe**                 | `sports_bridge` is imported inside a `try/except` at startup; if `httpx` is missing or the module fails, `_sports_bridge = None` and the app starts normally |
+
+### Example enriched response
+
+```json
+{
+  "found": true,
+  "data": { "...existing cache fields..." },
+  "stats": {
+    "source": "sports_stats_api",
+    "player": {
+      "name": "Raphinha",
+      "games": [ { "...per-game stats..." } ]
+    },
+    "team": {
+      "name": "Barcelona",
+      "record": { "wins": 18, "losses": 4, "draws": 3, "total_games": 25 },
+      "recent": [ { "...last 5 results..." } ],
+      "top_scorers": [ { "player": "Raphinha", "total": 14 } ]
+    },
+    "live": null
+  },
+  "query": { "team": "Barcelona", "player": "Raphinha", "sport": "Soccer", "market": null, "league": null }
+}
+```
+
+### Setup
+
+1. Start the stats service: `python realtime_data_fetch/stats_api.py` (default port `8001`)
+2. Set `STATS_API_URL=http://localhost:8001` in the cache API `.env`
+3. Optionally set `STATS_API_TOKEN` if the stats service has auth enabled
+4. Ensure `httpx` is installed (`pip install -r requirements.txt`)
+
+---
 
 ## Automated PR tests (`test_pr.py`)
 
@@ -392,13 +459,19 @@ Two workflows live in `.github/workflows/`:
 
 **`deploy.yml`** — triggered on push to `main`, manual dispatch, or PR targeting `main`:
 
-1. `validate` job: syntax check all Python files + run `pytest test_pr.py`
-2. `deploy` job (push to `main` only, skipped on PRs):
-   - Runs preflight fork-safety guard checks
-   - SSHes to VPS and executes `deploy.sh` (up to 2 attempts with 10-second retry gap)
-   - On success, runs a smoke test against the live service
-   - On smoke-test failure, sends an email alert via Gmail (configurable via secrets)
-   - Verifies `systemctl status` after deploy
+**`validate` job** (runs on every PR and push):
+
+1. Sets up Python 3.12 and installs `requirements.txt` plus `pytest`, `pytest-asyncio`, and `httpx`
+2. `py_compile` syntax check on `main.py`, `cache_db.py`, `redis_cache.py`, `sports_bridge.py`, `request_tracking.py`, `uuid_tracking.py`
+3. `pytest test_pr.py` — automated PR suite (see below)
+
+**`deploy` job** (push to `main` only, skipped on PRs):
+
+- Runs preflight fork-safety guard checks
+- SSHes to VPS and executes `deploy.sh` (up to 2 attempts with 10-second retry gap)
+- On success, runs a smoke test against the live service
+- On smoke-test failure, sends an email alert via Gmail (configurable via secrets)
+- Verifies `systemctl status` after deploy
 
 **`cleanup.yml`** — triggered when a pull request is closed (merged or declined):
 
