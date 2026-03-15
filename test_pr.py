@@ -432,11 +432,11 @@ class TestAdminDashboard:
 
     def test_dashboard_wrong_cookie_still_returns_200(self):
         """Wrong cookie no longer gates the page; JS/localStorage owns auth."""
-        r = CLIENT.get("/admin/dashboard", cookies={"admin_access": "wrong-token"})
+        r = CLIENT.get("/admin/dashboard", headers={"Cookie": "admin_access=wrong-token"})
         assert r.status_code == 200
 
     def test_dashboard_valid_cookie_returns_200(self):
-        r = CLIENT.get("/admin/dashboard", cookies={"admin_access": ADMIN_TOKEN})
+        r = CLIENT.get("/admin/dashboard", headers={"Cookie": f"admin_access={ADMIN_TOKEN}"})
         assert r.status_code == 200
 
     def test_dashboard_login_wrong_token_returns_403(self):
@@ -477,7 +477,7 @@ class TestDocsEndpoints:
         assert "info" in data, "openapi.json missing 'info' key"
 
     def test_openapi_json_with_admin_cookie_shows_admin_paths(self):
-        r = CLIENT.get("/openapi.json", cookies={"admin_access": ADMIN_TOKEN})
+        r = CLIENT.get("/openapi.json", headers={"Cookie": f"admin_access={ADMIN_TOKEN}"})
         data = r.json()
         paths = data.get("paths", {})
         assert any("admin" in p for p in paths), "Admin paths not visible with admin cookie"
@@ -782,6 +782,403 @@ class TestAnalyticsEndpoints:
     def test_trends_accepts_admin_does_not_crash(self):
         r = CLIENT.get("/admin/analytics/trends", headers=admin_headers())
         assert r.status_code not in (401, 403, 500), f"Unexpected: {r.status_code} {r.text[:200]}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Batch size limiting (DoS protection)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestBatchSizeLimit:
+    def test_precision_batch_at_max_size_is_accepted(self):
+        """Exactly 20 queries (the limit) must be accepted."""
+        queries = [{"market": "moneyline"}] * 20
+        r = CLIENT.post(
+            "/cache/batch/precision",
+            json={"queries": queries},
+            headers=user_headers(),
+        )
+        assert r.status_code not in (422, 500), (
+            f"Max-size batch was unexpectedly rejected: {r.status_code} {r.text[:200]}"
+        )
+
+    def test_precision_batch_over_limit_returns_422(self):
+        """21 queries must be rejected with 422."""
+        queries = [{"market": "moneyline"}] * 21
+        r = CLIENT.post(
+            "/cache/batch/precision",
+            json={"queries": queries},
+            headers=user_headers(),
+        )
+        assert r.status_code == 422, (
+            f"Expected 422 for oversized batch, got {r.status_code}: {r.text[:200]}"
+        )
+
+    def test_precision_batch_over_limit_message_mentions_limit(self):
+        """The 422 response body must mention the size limit."""
+        queries = [{"market": "moneyline"}] * 25
+        r = CLIENT.post(
+            "/cache/batch/precision",
+            json={"queries": queries},
+            headers=user_headers(),
+        )
+        assert r.status_code == 422
+        body = r.text
+        assert any(word in body for word in ("20", "Maximum", "maximum", "queries")), (
+            f"422 message should mention the limit: {body[:300]}"
+        )
+
+    def test_precision_batch_empty_queries_accepted(self):
+        """Empty queries list [] must be accepted (returns empty result)."""
+        r = CLIENT.post(
+            "/cache/batch/precision",
+            json={"queries": []},
+            headers=user_headers(),
+        )
+        assert r.status_code in (200,), (
+            f"Empty queries should return 200, got {r.status_code}: {r.text[:200]}"
+        )
+
+    def test_precision_batch_counters_are_consistent(self):
+        """successful + failed must equal total_queries in any response."""
+        r = CLIENT.post(
+            "/cache/batch/precision",
+            json={"queries": [{"market": "moneyline"}, {"player": "LeBron James"}]},
+            headers=user_headers(),
+        )
+        if r.status_code == 200:
+            data = r.json()
+            succ = data.get("successful", 0)
+            fail = data.get("failed", 0)
+            total = data.get("total_queries", 0)
+            assert succ + fail == total, (
+                f"successful({succ}) + failed({fail}) != total_queries({total})"
+            )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# /cache/batch schema validation
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestBatchSchemaValidation:
+    def test_wrong_schema_precision_format_returns_422(self):
+        """{queries:[...]} sent to /cache/batch must be rejected, not silently {}."""
+        r = CLIENT.post(
+            "/cache/batch",
+            json={"queries": [{"player": "LeBron James", "sport": "basketball"}]},
+            headers=user_headers(),
+        )
+        assert r.status_code == 422, (
+            f"Expected 422 for wrong schema (queries key), got {r.status_code}: {r.text[:200]}"
+        )
+
+    def test_sport_only_body_returns_422(self):
+        """sport alone with no list field must be rejected."""
+        r = CLIENT.post(
+            "/cache/batch",
+            json={"sport": "basketball"},
+            headers=user_headers(),
+        )
+        assert r.status_code == 422, (
+            f"sport-only body should be 422, got {r.status_code}: {r.text[:200]}"
+        )
+
+    def test_all_empty_lists_returns_200(self):
+        """All-empty lists {team:[], player:[], ...} is valid — returns 200 with {}."""
+        r = CLIENT.post(
+            "/cache/batch",
+            json={"team": [], "player": [], "market": [], "league": []},
+            headers=user_headers(),
+        )
+        assert r.status_code == 200, (
+            f"All-empty lists should return 200, got {r.status_code}: {r.text[:200]}"
+        )
+
+    def test_single_list_field_accepted(self):
+        """A body with just one list key (e.g., market) is valid."""
+        r = CLIENT.post(
+            "/cache/batch",
+            json={"market": ["moneyline"]},
+            headers=user_headers(),
+        )
+        assert r.status_code not in (422, 500), (
+            f"Single-field batch rejected: {r.status_code}: {r.text[:200]}"
+        )
+
+    def test_precision_batch_missing_queries_key_returns_422(self):
+        """No queries key at all → 422 from Pydantic."""
+        r = CLIENT.post(
+            "/cache/batch/precision",
+            json={"player": "LeBron James"},
+            headers=user_headers(),
+        )
+        assert r.status_code == 422, (
+            f"Expected 422 for missing queries key, got {r.status_code}: {r.text[:200]}"
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# include_stats query parameter on GET /cache
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestIncludeStats:
+    def test_invalid_bool_returns_422(self):
+        """include_stats=notabool must be rejected by FastAPI's type coercion."""
+        r = CLIENT.get(
+            "/cache",
+            params={"market": "moneyline", "include_stats": "notabool"},
+            headers=user_headers(),
+        )
+        assert r.status_code == 422, (
+            f"Expected 422 for invalid bool, got {r.status_code}"
+        )
+
+    def test_default_no_stats_key_in_response(self):
+        """Default include_stats=false: stats and stats_unavailable must be absent."""
+        with patch("main.get_cache_entry", return_value={"type": "market", "normalized_name": "Moneyline"}):
+            r = CLIENT.get("/cache", params={"market": "moneyline"}, headers=user_headers())
+        assert r.status_code == 200
+        data = r.json()
+        assert "stats" not in data, "stats key must not appear when include_stats=false"
+        assert "stats_unavailable" not in data, "stats_unavailable must not appear by default"
+
+    def test_include_stats_true_bridge_none_adds_unavailable(self):
+        """When _sports_bridge is None, include_stats=true → stats_unavailable:true."""
+        with (
+            patch("main.get_cache_entry", return_value={"type": "market", "normalized_name": "Moneyline"}),
+            patch("main._sports_bridge", None),
+        ):
+            r = CLIENT.get(
+                "/cache",
+                params={"market": "moneyline", "include_stats": "true"},
+                headers=user_headers(),
+            )
+        assert r.status_code == 200
+        assert r.json().get("stats_unavailable") is True, (
+            f"Expected stats_unavailable=true when bridge is None: {r.json()}"
+        )
+
+    def test_include_stats_true_bridge_returns_none_adds_unavailable(self):
+        """When bridge returns None (no data found), stats_unavailable:true is set."""
+        async def _null_enrich(*a, **kw):
+            return None
+
+        mock_bridge = MagicMock()
+        mock_bridge.enrich = _null_enrich
+        with (
+            patch("main.get_cache_entry", return_value={"type": "market", "normalized_name": "Moneyline"}),
+            patch("main._sports_bridge", mock_bridge),
+        ):
+            r = CLIENT.get(
+                "/cache",
+                params={"market": "moneyline", "include_stats": "true"},
+                headers=user_headers(),
+            )
+        assert r.status_code == 200
+        assert r.json().get("stats_unavailable") is True, (
+            f"Expected stats_unavailable=true when bridge returns None: {r.json()}"
+        )
+
+    def test_include_stats_true_bridge_returns_data_adds_stats_key(self):
+        """When bridge returns data, stats key is present and stats_unavailable is absent."""
+        mock_stats = {"source": "sports_api", "player": {"name": "LeBron James", "games": []}}
+
+        async def _enrich(*a, **kw):
+            return mock_stats
+
+        mock_bridge = MagicMock()
+        mock_bridge.enrich = _enrich
+        with (
+            patch("main.get_cache_entry", return_value={"type": "player", "normalized_name": "LeBron James"}),
+            patch("main._sports_bridge", mock_bridge),
+        ):
+            r = CLIENT.get(
+                "/cache",
+                params={"player": "LeBron James", "include_stats": "true"},
+                headers=user_headers(),
+            )
+        assert r.status_code == 200
+        data = r.json()
+        assert "stats" in data, f"Expected stats key when bridge returns data: {data}"
+        assert "stats_unavailable" not in data, "stats_unavailable must not appear when stats is present"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HTTP method enforcement
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestHTTPMethodEnforcement:
+    def test_cache_post_returns_405(self):
+        r = CLIENT.post("/cache", json={}, headers=user_headers())
+        assert r.status_code == 405, f"Expected 405 for POST /cache, got {r.status_code}"
+
+    def test_cache_delete_returns_405(self):
+        r = CLIENT.delete("/cache", headers=admin_headers())
+        assert r.status_code == 405, f"Expected 405 for DELETE /cache, got {r.status_code}"
+
+    def test_cache_put_returns_405(self):
+        r = CLIENT.put("/cache", json={}, headers=admin_headers())
+        assert r.status_code == 405, f"Expected 405 for PUT /cache, got {r.status_code}"
+
+    def test_cache_batch_get_returns_405(self):
+        r = CLIENT.get("/cache/batch", headers=user_headers())
+        assert r.status_code == 405, f"Expected 405 for GET /cache/batch, got {r.status_code}"
+
+    def test_cache_batch_precision_get_returns_405(self):
+        r = CLIENT.get("/cache/batch/precision", headers=user_headers())
+        assert r.status_code == 405, f"Expected 405 for GET /cache/batch/precision, got {r.status_code}"
+
+    def test_leagues_post_returns_405(self):
+        r = CLIENT.post("/leagues", json={}, headers=user_headers())
+        assert r.status_code == 405, f"Expected 405 for POST /leagues, got {r.status_code}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Input edge cases — injection, unicode, extreme lengths
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestInputEdgeCases:
+    def test_sql_injection_in_player_does_not_crash(self):
+        r = CLIENT.get(
+            "/cache",
+            params={"player": "' OR 1=1--", "sport": "basketball"},
+            headers=user_headers(),
+        )
+        assert r.status_code in (200, 404), f"SQL injection unexpected status: {r.status_code}"
+        assert r.status_code != 500, "SQL injection caused server crash"
+
+    def test_xss_payload_in_player_does_not_crash(self):
+        r = CLIENT.get(
+            "/cache",
+            params={"player": "<script>alert(1)</script>", "sport": "basketball"},
+            headers=user_headers(),
+        )
+        assert r.status_code in (200, 404), f"XSS payload unexpected status: {r.status_code}"
+        assert r.status_code != 500, "XSS payload caused server crash"
+
+    def test_unicode_player_name_does_not_crash(self):
+        r = CLIENT.get(
+            "/cache",
+            params={"player": "Ñoño Ünïcödé Dąbrowskï", "sport": "soccer"},
+            headers=user_headers(),
+        )
+        assert r.status_code in (200, 404), f"Unicode caused crash: {r.status_code}"
+
+    def test_very_long_player_name_does_not_crash(self):
+        r = CLIENT.get(
+            "/cache",
+            params={"player": "A" * 200, "sport": "basketball"},
+            headers=user_headers(),
+        )
+        assert r.status_code in (200, 404), f"Long name unexpected status: {r.status_code}"
+        assert r.status_code != 500, "Long name caused server crash"
+
+    def test_precision_batch_sql_injection_does_not_crash(self):
+        r = CLIENT.post(
+            "/cache/batch/precision",
+            json={"queries": [{"player": "' OR 1=1--", "sport": "basketball"}]},
+            headers=user_headers(),
+        )
+        assert r.status_code != 500, f"SQL injection in precision batch crashed: {r.text[:200]}"
+
+    def test_batch_multiple_injection_payloads_do_not_crash(self):
+        r = CLIENT.post(
+            "/cache/batch",
+            json={"player": ["' OR 1=1--", "<script>x</script>", "A" * 150], "sport": "basketball"},
+            headers=user_headers(),
+        )
+        assert r.status_code != 500, f"Injection payloads in batch crashed: {r.text[:200]}"
+
+    def test_precision_batch_empty_string_fields_do_not_crash(self):
+        r = CLIENT.post(
+            "/cache/batch/precision",
+            json={"queries": [{"player": "", "sport": "basketball"}]},
+            headers=user_headers(),
+        )
+        assert r.status_code != 500, f"Empty string in batch crashed: {r.text[:200]}"
+
+    def test_xml_content_type_to_batch_returns_422(self):
+        """Non-JSON content type must be rejected, not crash."""
+        r = CLIENT.post(
+            "/cache/batch/precision",
+            content=b"<query><player>LeBron</player></query>",
+            headers={**user_headers(), "Content-Type": "text/xml"},
+        )
+        assert r.status_code == 422, f"Expected 422 for XML body, got {r.status_code}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Response shape when result IS found
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestFoundResponseShape:
+    _MOCK_MARKET = {
+        "type": "market",
+        "normalized_name": "Moneyline",
+        "market_type_id": 7,
+        "sports": ["Basketball"],
+    }
+
+    def test_found_response_has_found_true(self):
+        with patch("main.get_cache_entry", return_value=self._MOCK_MARKET):
+            r = CLIENT.get("/cache", params={"market": "moneyline"}, headers=user_headers())
+        assert r.status_code == 200
+        assert r.json().get("found") is True
+
+    def test_found_response_has_data_key(self):
+        with patch("main.get_cache_entry", return_value=self._MOCK_MARKET):
+            r = CLIENT.get("/cache", params={"market": "moneyline"}, headers=user_headers())
+        assert "data" in r.json()
+
+    def test_found_response_has_query_key(self):
+        with patch("main.get_cache_entry", return_value=self._MOCK_MARKET):
+            r = CLIENT.get("/cache", params={"market": "moneyline"}, headers=user_headers())
+        assert "query" in r.json()
+
+    def test_not_found_response_has_found_false(self):
+        # session mock already returns None → 404
+        r = CLIENT.get("/cache", params={"market": "moneyline"}, headers=user_headers())
+        assert r.status_code == 404
+        assert r.json().get("found") is False
+
+    def test_precision_batch_result_items_have_required_fields(self):
+        r = CLIENT.post(
+            "/cache/batch/precision",
+            json={"queries": [{"market": "moneyline"}]},
+            headers=user_headers(),
+        )
+        if r.status_code == 200:
+            results = r.json().get("results", [])
+            if results:
+                item = results[0]
+                assert "query" in item, "Each precision result must have a 'query' field"
+                assert "found" in item, "Each precision result must have a 'found' field"
+                assert "data" in item, "Each precision result must have a 'data' field"
+
+    def test_precision_batch_has_all_counter_fields(self):
+        r = CLIENT.post(
+            "/cache/batch/precision",
+            json={"queries": [{"market": "moneyline"}]},
+            headers=user_headers(),
+        )
+        if r.status_code == 200:
+            data = r.json()
+            for key in ("results", "total_queries", "successful", "failed"):
+                assert key in data, f"Missing key '{key}' in precision batch response"
+
+    def test_precision_batch_counters_are_consistent(self):
+        r = CLIENT.post(
+            "/cache/batch/precision",
+            json={"queries": [{"market": "moneyline"}, {"player": "LeBron James"}]},
+            headers=user_headers(),
+        )
+        if r.status_code == 200:
+            data = r.json()
+            succ = data.get("successful", 0)
+            fail = data.get("failed", 0)
+            total = data.get("total_queries", 0)
+            assert succ + fail == total, (
+                f"successful({succ}) + failed({fail}) != total_queries({total})"
+            )
 
 
 class TestSourceFileCoverage:

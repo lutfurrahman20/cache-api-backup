@@ -4,6 +4,7 @@ Provides normalized cache lookups for sports betting markets, teams, and players
 Includes Redis caching layer for improved performance.
 """
 
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, Query, HTTPException, Body, Security, Depends, Request, Cookie, Form
 from fastapi.openapi.docs import get_swagger_ui_html
 from fastapi.openapi.utils import get_openapi
@@ -255,23 +256,25 @@ def verify_admin_token(credentials: HTTPAuthorizationCredentials = Security(secu
         detail="Admin access required. This endpoint requires an admin API token."
     )
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup: ensure Redis is available on local Windows dev machines
+    if platform.system() == "Windows" and not os.getenv('REDIS_HOST'):
+        ensure_redis_container()
+    # Seed env-var tokens into the managed token store (idempotent)
+    await run_in_threadpool(request_tracking.seed_env_tokens, ADMIN_KEY, NON_ADMIN_KEY)
+    yield
+    # Shutdown: nothing to tear down (Redis is external)
+
 app = FastAPI(
     title="Cache API",
     description="Sports betting cache normalization service with Redis caching",
     version="2.0.0",
     docs_url=None,
     redoc_url=None,
-    openapi_url=None
+    openapi_url=None,
+    lifespan=lifespan,
 )
-
-# On startup, ensure dockerized Redis is running when we're in a local
-# Windows environment and no explicit REDIS_HOST has been provided.
-@app.on_event("startup")
-async def startup_containers():
-    if platform.system() == "Windows" and not os.getenv('REDIS_HOST'):
-        ensure_redis_container()
-    # Seed env-var tokens into the managed token store (idempotent)
-    await run_in_threadpool(request_tracking.seed_env_tokens, ADMIN_KEY, NON_ADMIN_KEY)
 
 # Mount static files for dashboard
 app.mount("/admin/js", StaticFiles(directory="js"), name="admin_js")
@@ -769,7 +772,7 @@ async def get_batch_cache(
         session_id = getattr(request.state, 'session_id', None)
         if session_id:
             request_group_id = str(uuid.uuid4())
-            batch_body = request_body.dict(exclude_none=True)
+            batch_body = request_body.model_dump(exclude_none=True)
             # Track missing teams
             if 'team' in result:
                 for team_name, team_data in result['team'].items():
