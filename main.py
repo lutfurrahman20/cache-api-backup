@@ -12,7 +12,7 @@ from fastapi.responses import JSONResponse, FileResponse, HTMLResponse, Redirect
 from fastapi.staticfiles import StaticFiles
 from fastapi.concurrency import run_in_threadpool
 from typing import Optional, Dict, Any, List
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 import hmac
 import uvicorn
 import os
@@ -142,6 +142,9 @@ NON_ADMIN_KEY = user_key
 
 # All valid tokens (admin + non-admin)
 VALID_API_TOKENS = {token for token in [ADMIN_KEY, NON_ADMIN_KEY] if token}
+
+# Batch size limits — prevent excessively large requests from tying up the server
+MAX_PRECISION_BATCH_SIZE = int(os.getenv('MAX_PRECISION_BATCH_SIZE', 20))
 
 # Rate limiting configuration
 RATE_LIMIT_PER_MINUTE = int(os.getenv('RATE_LIMIT_PER_MINUTE', 60))
@@ -410,6 +413,14 @@ class BatchQueryRequest(BaseModel):
     sport: Optional[str] = None  # Sport context for team/league queries
     league: Optional[List[str]] = None
 
+    @model_validator(mode='after')
+    def require_at_least_one_list(self):
+        if not any([self.team, self.player, self.market, self.league]):
+            raise ValueError(
+                "At least one of 'team', 'player', 'market', or 'league' must be provided with at least one value"
+            )
+        return self
+
 class PrecisionBatchItem(BaseModel):
     """Single precision query item"""
     team: Optional[str] = None
@@ -421,6 +432,16 @@ class PrecisionBatchItem(BaseModel):
 class PrecisionBatchRequest(BaseModel):
     """Request model for precision batch queries"""
     queries: List[PrecisionBatchItem]
+
+    @field_validator('queries')
+    @classmethod
+    def limit_query_count(cls, v):
+        if len(v) > MAX_PRECISION_BATCH_SIZE:
+            raise ValueError(
+                f"Maximum {MAX_PRECISION_BATCH_SIZE} queries per batch request allowed. "
+                f"Received {len(v)}."
+            )
+        return v
 
 
 class CreateTokenRequest(BaseModel):
@@ -674,8 +695,13 @@ async def get_cache(
                 stats_data = await _sports_bridge.enrich(player, team, sport)
                 if stats_data is not None:
                     response_content["stats"] = stats_data
+                else:
+                    response_content["stats_unavailable"] = True
             except Exception as _stats_exc:
                 print(f"[WARN] stats enrichment failed (non-critical): {_stats_exc}")
+                response_content["stats_unavailable"] = True
+        elif include_stats and _sports_bridge is None:
+            response_content["stats_unavailable"] = True
 
         return JSONResponse(status_code=200, content=response_content)
         
