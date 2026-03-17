@@ -593,6 +593,11 @@ class TestSourceFileSafety:
     def test_deploy_sh_no_hardcoded_production_url(self):
         self._check_urls("deploy.sh")
 
+    def test_deploy_sh_pulls_git_lfs_objects(self):
+        content = Path("deploy.sh").read_text(encoding="utf-8")
+        assert "git lfs pull origin \"$DEPLOY_BRANCH\"" in content
+        assert "git lfs install --local" in content
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Source file coverage snapshot — fails when new functions/endpoints are added

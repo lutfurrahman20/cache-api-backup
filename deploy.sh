@@ -132,6 +132,17 @@ else
     print_success "Redis is already installed"
 fi
 
+# Check if Git LFS is installed
+print_info "Checking Git LFS installation..."
+if ! command -v git-lfs &> /dev/null; then
+    print_info "Git LFS not found. Installing Git LFS..."
+    sudo apt update
+    sudo apt install git-lfs -y
+    print_success "Git LFS installed"
+else
+    print_success "Git LFS is already installed"
+fi
+
 # Start and enable Redis
 print_info "Configuring Redis..."
 sudo systemctl enable redis-server
@@ -175,6 +186,11 @@ else
     git reset --hard "origin/$DEPLOY_BRANCH"
     print_success "Repository updated"
 fi
+
+print_info "Pulling Git LFS objects..."
+git lfs install --local
+git lfs pull origin "$DEPLOY_BRANCH"
+print_success "Git LFS objects pulled"
 
 # Create virtual environment if it doesn't exist
 if [ ! -d "$VENV_DIR" ]; then
