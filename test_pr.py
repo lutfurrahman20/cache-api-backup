@@ -17,7 +17,7 @@ Coverage:
 """
 
 import os
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch, MagicMock, AsyncMock
 
 # ── Inject dummy tokens BEFORE importing the app ──────────────────────────────
 # This lets the app boot without real secrets.  Tests validate that the auth
@@ -141,6 +141,30 @@ class TestAuthLayer:
     def test_leagues_no_token_returns_401_or_403(self):
         r = CLIENT.get("/leagues")
         assert r.status_code in (401, 403)
+
+    def test_event_check_no_token_returns_401_or_403(self):
+        r = CLIENT.get(
+            "/event/check",
+            params={"event_id": "761496", "market": "total", "pick": "over", "line": 2.5},
+        )
+        assert r.status_code in (401, 403)
+
+    def test_event_check_wrong_token_returns_401_or_403(self):
+        r = CLIENT.get(
+            "/event/check",
+            params={"event_id": "761496", "market": "total", "pick": "over", "line": 2.5},
+            headers=wrong_headers(),
+        )
+        assert r.status_code in (401, 403)
+
+    def test_event_check_valid_token_does_not_return_401_or_403(self):
+        with patch("main._sports_bridge", None):
+            r = CLIENT.get(
+                "/event/check",
+                params={"event_id": "761496", "market": "total", "pick": "over", "line": 2.5},
+                headers=user_headers(),
+            )
+        assert r.status_code not in (401, 403), f"Valid token was rejected with {r.status_code}"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1012,6 +1036,34 @@ class TestEventCheck:
         )
         assert r.status_code == 400
 
+    def test_event_check_invalid_date_returns_400(self):
+        class _BridgeHTTPError(Exception):
+            def __init__(self, status_code, detail):
+                super().__init__(detail)
+                self.status_code = status_code
+                self.detail = detail
+
+        async def _market_check(*a, **kw):
+            raise _BridgeHTTPError(400, "date must be in YYYY-MM-DD format")
+
+        mock_bridge = MagicMock()
+        mock_bridge.market_check = _market_check
+        with patch("main._sports_bridge", mock_bridge):
+            r = CLIENT.get(
+                "/event/check",
+                params={
+                    "date": "03-12-2026",
+                    "team": "PSG",
+                    "opponent": "Chelsea",
+                    "market": "total",
+                    "pick": "over",
+                    "line": 5.5,
+                },
+                headers=user_headers(),
+            )
+        assert r.status_code == 400
+        assert "YYYY-MM-DD" in r.json().get("detail", "")
+
     def test_event_check_bridge_unavailable_returns_503(self):
         with patch("main._sports_bridge", None):
             r = CLIENT.get(
@@ -1028,14 +1080,51 @@ class TestEventCheck:
             )
         assert r.status_code == 503
 
+    def test_event_check_bridge_http_error_passthrough(self):
+        class _BridgeHTTPError(Exception):
+            def __init__(self, status_code, detail):
+                super().__init__(detail)
+                self.status_code = status_code
+                self.detail = detail
+
+        async def _market_check(*a, **kw):
+            raise _BridgeHTTPError(404, "No matching event found")
+
+        mock_bridge = MagicMock()
+        mock_bridge.market_check = _market_check
+
+        with patch("main._sports_bridge", mock_bridge):
+            r = CLIENT.get(
+                "/event/check",
+                params={
+                    "event_id": "missing-event",
+                    "market": "total",
+                    "pick": "over",
+                    "line": 5.5,
+                },
+                headers=user_headers(),
+            )
+        assert r.status_code == 404
+        assert "No matching event found" in r.json().get("detail", "")
+
     def test_event_check_bridge_returns_payload(self):
         mock_result = {
             "found": True,
+            "source": "historical",
+            "settled": True,
             "market": "total",
             "pick": "over",
             "line": 5.5,
             "result": True,
             "outcome": "win",
+            "event": {
+                "event_id": "761496",
+                "sport": "soccer",
+                "home_team": "Vancouver Whitecaps",
+                "away_team": "Minnesota United FC",
+            },
+            "score": {"home": 6, "away": 0, "total": 6},
+            "pricing": {"game_total": 2.5},
         }
 
         async def _market_check(*a, **kw):
@@ -1058,8 +1147,14 @@ class TestEventCheck:
                 headers=user_headers(),
             )
         assert r.status_code == 200
-        assert r.json().get("result") is True
-        assert r.json().get("outcome") == "win"
+        data = r.json()
+        assert data.get("result") is True
+        assert data.get("outcome") == "win"
+        assert data.get("found") is True
+        assert data.get("settled") is True
+        assert data.get("event", {}).get("event_id") == "761496"
+        assert data.get("score", {}).get("total") == 6
+        assert "pricing" in data
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1090,6 +1185,10 @@ class TestHTTPMethodEnforcement:
     def test_leagues_post_returns_405(self):
         r = CLIENT.post("/leagues", json={}, headers=user_headers())
         assert r.status_code == 405, f"Expected 405 for POST /leagues, got {r.status_code}"
+
+    def test_event_check_post_returns_405(self):
+        r = CLIENT.post("/event/check", json={}, headers=user_headers())
+        assert r.status_code == 405, f"Expected 405 for POST /event/check, got {r.status_code}"
 
 
 # ─────────────────────────────────────────────────────────────────────────────

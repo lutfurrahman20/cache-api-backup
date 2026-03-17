@@ -109,6 +109,16 @@ def summarize_request(path: str, params: Optional[Dict[str, Any]], body: Optiona
         return f"precision(queries={len(q)})"
     if path == "/cache" and isinstance(params, dict):
         return f"cache(params={','.join(sorted(params.keys()))})"
+    if path == "/event/check" and isinstance(params, dict):
+        market = params.get("market") or "?"
+        pick = params.get("pick") or "?"
+        locator = params.get("event_id") or "/".join(
+            str(params.get(key) or "?")
+            for key in ("date", "team", "opponent")
+        )
+        line = params.get("line")
+        suffix = f",line={line}" if line is not None else ""
+        return f"event_check(market={market},pick={pick},locator={locator}{suffix})"
     if path == "/leagues" and isinstance(params, dict):
         return f"leagues(params={','.join(sorted(params.keys())) or 'none'})"
     return path
@@ -142,6 +152,15 @@ def summarize_response(path: str, data: Any) -> str:
         leagues = data.get("leagues")
         if isinstance(leagues, list):
             return f"leagues={len(leagues)}"
+
+    if path == "/event/check":
+        if "detail" in data:
+            return f"detail={data.get('detail')}"
+        result = data.get("result")
+        source = data.get("source")
+        settled = data.get("settled")
+        outcome = data.get("outcome")
+        return f"result={result} source={source} settled={settled} outcome={outcome}"
 
     return f"keys={len(data.keys())}"
 
@@ -283,6 +302,11 @@ SEED = {
     "search": "premier",
 }
 
+EVENT_CHECK_EVENT_ID = os.getenv("EVENT_CHECK_EVENT_ID", "761496")
+EVENT_CHECK_DATE = os.getenv("EVENT_CHECK_DATE", "2026-03-12")
+EVENT_CHECK_TEAM = os.getenv("EVENT_CHECK_TEAM", "PSG")
+EVENT_CHECK_OPPONENT = os.getenv("EVENT_CHECK_OPPONENT", "Chelsea")
+
 
 def collect_pool_values() -> Dict[str, List[str]]:
     markets: List[str] = [SEED["market"]]
@@ -386,6 +410,34 @@ def quick_run(token: str) -> None:
             f"case={i} request={summarize_request('/cache/batch', None, body)} "
             f"status={status} time_ms={elapsed:.1f} response={summarize_response('/cache/batch', payload)}"
         )
+
+    event_case = build_event_check_cases()[0]
+
+    print("--- production: GET /event/check ---")
+    status, payload, elapsed = request_json(
+        event_case["method"],
+        PROD_BASE,
+        "/event/check",
+        token=token,
+        params=event_case["params"],
+    )
+    print(
+        f"request={summarize_request('/event/check', event_case['params'], None)} "
+        f"status={status} time_ms={elapsed:.1f} response={summarize_response('/event/check', payload)}"
+    )
+
+    print("--- local: GET /event/check ---")
+    status, payload, elapsed = request_json(
+        event_case["method"],
+        LOCAL_BASE,
+        "/event/check",
+        token=token,
+        params=event_case["params"],
+    )
+    print(
+        f"request={summarize_request('/event/check', event_case['params'], None)} "
+        f"status={status} time_ms={elapsed:.1f} response={summarize_response('/event/check', payload)}"
+    )
 
 
 def compare_batch_truth(token: str, max_show: int = 25) -> None:
@@ -585,6 +637,110 @@ def build_leagues_cases(pool: Dict[str, List[str]]) -> List[Dict[str, Any]]:
     return cases
 
 
+def build_event_check_cases() -> List[Dict[str, Any]]:
+    return [
+        {
+            "name": "event check total by event id",
+            "method": "GET",
+            "params": {
+                "event_id": EVENT_CHECK_EVENT_ID,
+                "sport": "soccer",
+                "market": "total",
+                "pick": "over",
+                "line": 2.5,
+            },
+            "expected": {200, 404},
+        },
+        {
+            "name": "event check moneyline by matchup",
+            "method": "GET",
+            "params": {
+                "date": EVENT_CHECK_DATE,
+                "team": EVENT_CHECK_TEAM,
+                "opponent": EVENT_CHECK_OPPONENT,
+                "sport": "soccer",
+                "market": "moneyline",
+                "pick": EVENT_CHECK_TEAM,
+            },
+            "expected": {200, 404},
+        },
+        {
+            "name": "event check missing locator",
+            "method": "GET",
+            "params": {
+                "sport": "soccer",
+                "market": "total",
+                "pick": "over",
+                "line": 2.5,
+            },
+            "expected": {400},
+        },
+        {
+            "name": "event check invalid date",
+            "method": "GET",
+            "params": {
+                "date": "2026-13-40",
+                "team": EVENT_CHECK_TEAM,
+                "opponent": EVENT_CHECK_OPPONENT,
+                "sport": "soccer",
+                "market": "total",
+                "pick": "over",
+                "line": 2.5,
+            },
+            "expected": {400},
+        },
+        {
+            "name": "event check post not allowed",
+            "method": "POST",
+            "params": {
+                "event_id": EVENT_CHECK_EVENT_ID,
+                "sport": "soccer",
+                "market": "moneyline",
+                "pick": EVENT_CHECK_TEAM,
+            },
+            "expected": {405},
+        },
+    ]
+
+
+def build_event_check_compare_cases() -> List[Dict[str, Any]]:
+    return [
+        {
+            "name": "event check missing locator",
+            "method": "GET",
+            "params": {
+                "sport": "soccer",
+                "market": "total",
+                "pick": "over",
+                "line": 2.5,
+            },
+        },
+        {
+            "name": "event check invalid date",
+            "method": "GET",
+            "params": {
+                "date": "2026-13-40",
+                "team": EVENT_CHECK_TEAM,
+                "opponent": EVENT_CHECK_OPPONENT,
+                "sport": "soccer",
+                "market": "total",
+                "pick": "over",
+                "line": 2.5,
+            },
+        },
+        {
+            "name": "event check post not allowed",
+            "method": "POST",
+            "params": {
+                "event_id": EVENT_CHECK_EVENT_ID,
+                "sport": "soccer",
+                "market": "moneyline",
+                "pick": EVENT_CHECK_TEAM,
+            },
+        },
+    ]
+
+
 def run_full_suite(
     env_name: str,
     base_url: str,
@@ -594,6 +750,7 @@ def run_full_suite(
     include_destructive: bool,
 ) -> List[CaseResult]:
     results: List[CaseResult] = []
+    event_cases = build_event_check_cases()
 
     print(f"\n=== {env_name.upper()} | Public endpoints ===")
     results.append(run_case(env_name, base_url, "root", "GET", "/", {200}))
@@ -603,6 +760,8 @@ def run_full_suite(
     print(f"\n=== {env_name.upper()} | Auth behavior ===")
     results.append(run_case(env_name, base_url, "cache without token", "GET", "/cache", {401, 403}, params={"market": pool["markets"][0]}))
     results.append(run_case(env_name, base_url, "cache invalid token", "GET", "/cache", {401}, token="definitely-invalid-token", params={"market": pool["markets"][0]}))
+    results.append(run_case(env_name, base_url, "event check without token", "GET", "/event/check", {401, 403}, params=event_cases[0]["params"]))
+    results.append(run_case(env_name, base_url, "event check invalid token", "GET", "/event/check", {401}, token="definitely-invalid-token", params=event_cases[0]["params"]))
     results.append(run_case(env_name, base_url, "admin health with user token", "GET", "/health", {403}, token=user_token))
     results.append(run_case(env_name, base_url, "admin dashboard without token", "GET", "/admin/dashboard", {200}))  # auth is client-side JS; server always serves 200
 
@@ -665,6 +824,20 @@ def run_full_suite(
                 {200},
                 token=user_token,
                 params=params,
+            )
+        )
+
+    for case in event_cases:
+        results.append(
+            run_case(
+                env_name,
+                base_url,
+                case["name"],
+                case["method"],
+                "/event/check",
+                case["expected"],
+                token=user_token,
+                params=case["params"],
             )
         )
 
@@ -736,6 +909,7 @@ def extensive_run(token: str, targets: List[Tuple[str, str]]) -> None:
         "batch": {"total": 0, "same": 0},
         "precision": {"total": 0, "same": 0},
         "leagues": {"total": 0, "same": 0},
+        "event_check": {"total": 0, "same": 0},
     }
 
     print("\n[1] GET /cache combinations")
@@ -790,8 +964,21 @@ def extensive_run(token: str, targets: List[Tuple[str, str]]) -> None:
             f"response={summarize_response('/leagues', pj)} same={same}"
         )
 
+    print("\n[5] /event/check validation combinations")
+    for idx, case in enumerate(build_event_check_compare_cases(), start=1):
+        ps, pj, pt = request_json(case["method"], PROD_BASE, "/event/check", token=token, params=case["params"])
+        ls, lj, lt = request_json(case["method"], LOCAL_BASE, "/event/check", token=token, params=case["params"])
+        same = ps == ls and canonical_json(normalize_for_compare(pj)) == canonical_json(normalize_for_compare(lj))
+        summary["event_check"]["total"] += 1
+        summary["event_check"]["same"] += int(same)
+        print(
+            f"  case={idx} request={summarize_request('/event/check', case['params'], None)} "
+            f"status={ps}/{ls} time_ms={pt:.1f}/{lt:.1f} "
+            f"response={summarize_response('/event/check', pj)} same={same}"
+        )
+
     print("\n=== summary ===")
-    for key in ["cache", "batch", "precision", "leagues"]:
+    for key in ["cache", "batch", "precision", "leagues", "event_check"]:
         total = summary[key]["total"]
         same = summary[key]["same"]
         print(f"{key}: {same}/{total} identical")
@@ -856,7 +1043,7 @@ def main() -> None:
         "--mode",
         choices=["quick", "compare", "extensive", "full"],
         default="full",
-        help="quick: batch smoke; compare: /cache/batch diff; extensive: local-vs-prod combinations; full: endpoint health/auth/user/admin validation",
+        help="quick: batch + event-check smoke; compare: /cache/batch diff; extensive: local-vs-prod combinations; full: endpoint health/auth/user/admin validation",
     )
     parser.add_argument(
         "--target",
