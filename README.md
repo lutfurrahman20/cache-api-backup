@@ -276,12 +276,12 @@ Stats API bridge variables (all optional — leave `STATS_API_URL` blank to disa
 
 `testing.py` event-check defaults (optional overrides for smoke runs):
 
-| Variable               | Default      | Description                                             |
-| ---------------------- | ------------ | ------------------------------------------------------- |
-| `EVENT_CHECK_EVENT_ID` | `761496`     | Known event ID used by `testing.py` smoke coverage      |
-| `EVENT_CHECK_DATE`     | `2026-03-12` | Match date used for matchup-based event-check tests     |
-| `EVENT_CHECK_TEAM`     | `PSG`        | Team value used for matchup-based event-check tests     |
-| `EVENT_CHECK_OPPONENT` | `Chelsea`    | Opponent value used for matchup-based event-check tests |
+| Variable               | Default      | Description                                                                                           |
+| ---------------------- | ------------ | ----------------------------------------------------------------------------------------------------- |
+| `EVENT_CHECK_EVENT_ID` | `761496`     | Known event ID used by `testing.py` smoke coverage                                                    |
+| `EVENT_CHECK_DATE`     | `2026-03-12` | Match date used for matchup-based event-check tests                                                   |
+| `EVENT_CHECK_TEAM`     | `PSG`        | Team value used for matchup-based event-check tests                                                   |
+| `EVENT_CHECK_OPPONENT` | `Chelsea`    | Opponent value used for matchup-based event-check tests                                               |
 | `DEPLOY_ALLOW_GIT_DB`  | `false`      | Deploy override. When `false`, VPS preserves its local `sports_data.db` during GitHub Actions deploys |
 
 CI/CD smoke-test email alert variables (set as GitHub repository secrets):
@@ -329,7 +329,22 @@ Notes:
 
 - Normal commits and pushes should leave `sports_data.db` untracked
 - VPS deploys preserve the server's existing `sports_data.db` by default, even when Git contents differ
-- If you intentionally want a Git-provided `sports_data.db` to replace the VPS copy, set the GitHub Actions secret `DEPLOY_ALLOW_GIT_DB=true` for that deploy
+- If you intentionally want a Git-provided `sports_data.db` to replace the VPS copy, you must opt in explicitly
+
+Intentional database rollout flow:
+
+1. Confirm you really want to replace the VPS database with your local snapshot.
+2. Force-add the database file because it is gitignored:
+
+```bash
+git add -f sports_data.db
+```
+
+3. Commit and push that change normally.
+4. Set the GitHub Actions secret `DEPLOY_ALLOW_GIT_DB=true` before the deploy runs.
+5. After the deploy completes, set `DEPLOY_ALLOW_GIT_DB=false` again so future code-only deploys keep preserving the VPS database.
+
+If you skip step 4, the deploy will still preserve the existing VPS database even if the commit contains `sports_data.db`.
 
 ### Validation runner
 
@@ -418,10 +433,10 @@ python testing.py --mode full      --target prod --token <user_token> --admin-to
 
 Mode summary:
 
-- `quick`: smoke run for `/cache/batch` on local + prod
+- `quick`: smoke run for `/cache/batch` and `/event/check` on local + prod
 - `compare`: deep diff of `/cache/batch` payload responses between local and prod
-- `extensive`: broader local-vs-prod coverage for `/cache`, `/cache/batch`, `/cache/batch/precision`, `/leagues`
-- `full` (default): endpoint health/auth/user/admin validation with pass/fail summary
+- `extensive`: broader local-vs-prod coverage for `/cache`, `/cache/batch`, `/cache/batch/precision`, `/leagues`, and comparison-safe `/event/check` cases
+- `full` (default): endpoint health, auth, user, admin, and `/event/check` validation with pass/fail summary
 
 ### Target selection
 

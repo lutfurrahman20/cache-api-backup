@@ -674,6 +674,7 @@ KNOWN_DEPLOY_SH_VARS = {
     "ALLOW_PRIMARY_SERVICE_NAME", "PRODUCTION_SERVICE_NAME",
     "PRODUCTION_PORT", "NGINX_SITE_NAME", "PROTECTED_NGINX_SITE_NAME",
     "REQUIRE_UNIQUE_NAME", "LOCK_FILE",
+    "DB_FILE", "ALLOW_GIT_DB", "DB_BACKUP_FILE",
     # ANSI colour helpers (not deployment config)
     "RED", "GREEN", "YELLOW", "NC",
 }
@@ -1386,3 +1387,11 @@ class TestSourceFileCoverage:
         if not Path("deploy.sh").exists():
             pytest.skip("deploy.sh not present")
         self._assert_snapshot("deploy.sh variables", _scan_deploy_vars("deploy.sh"), KNOWN_DEPLOY_SH_VARS)
+
+    def test_deploy_db_preserve_toggle_is_wired(self):
+        deploy_content = Path("deploy.sh").read_text(encoding="utf-8")
+        workflow_content = Path(".github/workflows/deploy.yml").read_text(encoding="utf-8")
+
+        assert 'ALLOW_GIT_DB="${ALLOW_GIT_DB:-false}"' in deploy_content
+        assert 'if [ "$ALLOW_GIT_DB" != "true" ] && [ -f "$DB_FILE" ]; then' in deploy_content
+        assert 'export ALLOW_GIT_DB="${DEPLOY_ALLOW_GIT_DB:-false}"' in workflow_content
