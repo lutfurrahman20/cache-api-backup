@@ -15,6 +15,7 @@ FastAPI service for sports cache normalization with Redis-backed caching, batch 
 - Uses Redis for caching and SQLite for both lookup data and telemetry storage
 - Deploys to VPS through GitHub Actions + `deploy.sh` with fork-safety guards and retry logic
 - **Optional stats enrichment**: `GET /cache?include_stats=true` transparently fetches historical and live statistics from the internal `stats_api` service and merges them into the response — zero overhead when not configured
+- Exposes `GET /event/check` to evaluate a single event market (`moneyline`, `spread`, `total`) against historical or live data via the internal stats service
 
 ## Tech stack
 
@@ -121,7 +122,7 @@ On success, a `HttpOnly; Secure; SameSite=Strict` cookie named `admin_access` is
 
 - Per-IP in-memory limiter
 - Controlled by `RATE_LIMIT_PER_MINUTE` (default `60`)
-- Applied to user API routes (`/cache`, `/cache/batch`, `/cache/batch/precision`, `/leagues`)
+- Applied to user API routes (`/cache`, `/cache/batch`, `/cache/batch/precision`, `/leagues`, `/event/check`)
 - Returns `429 Too Many Requests` when exceeded
 
 ## Request tracking and observability
@@ -179,6 +180,13 @@ The MaxMind database file is required at `geoip/GeoLite2-City.mmdb`. If absent, 
 - `GET /leagues`
   - Query params: `sport`, `search`, `region`
   - Partial-match search, priority-ordered results (top 5 leagues first)
+- `GET /event/check`
+  - Query params:
+    - locator: either `event_id`, or `date` + `team` + `opponent`
+    - market inputs: `market`, `pick`, optional `line`, optional `sport`
+  - Supported markets: `moneyline`, `spread`, `total`
+  - Proxies to the internal stats service and returns live or historical market evaluation
+  - Returns `400` for invalid locator/date/market input, `404` when no matching event is found, and `200` with `{ found, result, outcome, settled, source, event, score, pricing }` when resolved
 
 ### Admin-only
 
@@ -266,6 +274,16 @@ Stats API bridge variables (all optional — leave `STATS_API_URL` blank to disa
 | `STATS_API_TIMEOUT` | `1.0`   | Hard timeout in seconds for stats requests — protects production response time                 |
 | `STATS_CACHE_TTL`   | `300`   | Redis TTL for cached stat payloads in seconds                                                  |
 
+`testing.py` event-check defaults (optional overrides for smoke runs):
+
+| Variable               | Default      | Description                                             |
+| ---------------------- | ------------ | ------------------------------------------------------- |
+| `EVENT_CHECK_EVENT_ID` | `761496`     | Known event ID used by `testing.py` smoke coverage      |
+| `EVENT_CHECK_DATE`     | `2026-03-12` | Match date used for matchup-based event-check tests     |
+| `EVENT_CHECK_TEAM`     | `PSG`        | Team value used for matchup-based event-check tests     |
+| `EVENT_CHECK_OPPONENT` | `Chelsea`    | Opponent value used for matchup-based event-check tests |
+| `DEPLOY_ALLOW_GIT_DB`  | `false`      | Deploy override. When `false`, VPS preserves its local `sports_data.db` during GitHub Actions deploys |
+
 CI/CD smoke-test email alert variables (set as GitHub repository secrets):
 
 | Variable             | Description                                      |
@@ -293,9 +311,38 @@ Notes:
 
 1. A caller adds `?include_stats=true` to any `GET /cache` request.
 2. If `STATS_API_URL` is set, `sports_bridge.enrich(player, team, sport)` is called after the normal cache lookup succeeds.
-3. The bridge queries up to three stats endpoints — `/stats/player`, `/stats/team`, `/stats/live` — using the same identifiers already present in the request.
+3. The bridge queries up to four stats endpoints — `/stats/player`, `/stats/team`, `/stats/live`, `/stats/market-check` — using the same identifiers already present in the request.
 4. Results are cached in Redis under `stats_bridge:*` keys (separate namespace, no collision with `cache:*` keys) with a configurable TTL (`STATS_CACHE_TTL`, default 5 min).
 5. The merged `stats` object is appended to the existing response. If the stats service is unavailable, the original response is returned unchanged.
+
+### Event market checks
+
+`GET /event/check` uses `sports_bridge.market_check(...)` to call the internal `/stats/market-check` endpoint.
+
+- Uses a dedicated Redis namespace: `stats_bridge:market:*`
+- Preserves handled client errors from the stats service (`400`, `404`, `422`)
+- Converts upstream outages or unexpected failures into `503` so callers can distinguish bad input from backend unavailability
+
+### Database deployment policy
+
+`sports_data.db` should not be part of routine commits.
+
+- Normal commits and pushes should leave `sports_data.db` untracked
+- VPS deploys preserve the server's existing `sports_data.db` by default, even when Git contents differ
+- If you intentionally want a Git-provided `sports_data.db` to replace the VPS copy, set the GitHub Actions secret `DEPLOY_ALLOW_GIT_DB=true` for that deploy
+
+### Validation runner
+
+`testing.py` now covers the event-check flow in addition to cache, batch, precision, leagues, and admin endpoints.
+
+```bash
+python testing.py --mode quick --target prod --token <user_token>
+python testing.py --target prod --token <user_token> --admin-token <admin_token>
+```
+
+- `quick`: batch smoke plus one `/event/check` smoke case on prod and local
+- `extensive`: local-vs-prod comparison for comparison-safe validation cases, including `/event/check`
+- `full`: auth, user, admin, and `/event/check` endpoint validation
 
 ### Safety guarantees
 

@@ -63,6 +63,7 @@ jobs:
       DEPLOY_PRODUCTION_PORT: ${{ secrets.DEPLOY_PRODUCTION_PORT }}
       DEPLOY_NGINX_SITE_NAME: ${{ secrets.DEPLOY_NGINX_SITE_NAME }}
       DEPLOY_PROTECTED_NGINX_SITE_NAME: ${{ secrets.DEPLOY_PROTECTED_NGINX_SITE_NAME }}
+      DEPLOY_ALLOW_GIT_DB: ${{ secrets.DEPLOY_ALLOW_GIT_DB }}
 
     steps:
       - name: Checkout code
@@ -182,6 +183,7 @@ jobs:
             export PRODUCTION_PORT="${PRODUCTION_PORT}"
             export NGINX_SITE_NAME="${NGINX_SITE_NAME}"
             export PROTECTED_NGINX_SITE_NAME="${PROTECTED_NGINX_SITE_NAME}"
+            export ALLOW_GIT_DB="${DEPLOY_ALLOW_GIT_DB:-false}"
             export REQUIRE_UNIQUE_NAME="false"
 
             chmod +x deploy.sh
@@ -261,6 +263,7 @@ jobs:
             export PRODUCTION_PORT="${PRODUCTION_PORT}"
             export NGINX_SITE_NAME="${NGINX_SITE_NAME}"
             export PROTECTED_NGINX_SITE_NAME="${PROTECTED_NGINX_SITE_NAME}"
+            export ALLOW_GIT_DB="${DEPLOY_ALLOW_GIT_DB:-false}"
             export REQUIRE_UNIQUE_NAME="false"
 
             chmod +x deploy.sh

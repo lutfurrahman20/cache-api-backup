@@ -30,7 +30,10 @@ PRODUCTION_PORT="${PRODUCTION_PORT:-5000}"
 NGINX_SITE_NAME="${NGINX_SITE_NAME:-${SERVICE_NAME}}"
 PROTECTED_NGINX_SITE_NAME="${PROTECTED_NGINX_SITE_NAME:-cache-api}"
 REQUIRE_UNIQUE_NAME="${REQUIRE_UNIQUE_NAME:-true}"
+DB_FILE="${DB_FILE:-sports_data.db}"
+ALLOW_GIT_DB="${ALLOW_GIT_DB:-false}"
 LOCK_FILE="/tmp/${SERVICE_NAME}.deploy.lock"
+DB_BACKUP_FILE=""
 
 if [ -z "$PREVIOUS_SERVICE_NAME" ] && [[ "$SERVICE_NAME" == *-prod ]]; then
     PREVIOUS_SERVICE_NAME="${SERVICE_NAME%-prod}"
@@ -60,7 +63,7 @@ if [ -f "$LOCK_FILE" ]; then
     print_error "Another deployment appears to be running for $SERVICE_NAME ($LOCK_FILE exists)"
     exit 1
 fi
-trap 'rm -f "$LOCK_FILE"' EXIT
+trap 'rm -f "$LOCK_FILE"; if [ -n "$DB_BACKUP_FILE" ] && [ -f "$DB_BACKUP_FILE" ]; then rm -f "$DB_BACKUP_FILE"; fi' EXIT
 touch "$LOCK_FILE"
 
 # Check if running as correct user
@@ -79,6 +82,8 @@ echo "  PREVIOUS_SERVICE_NAME=${PREVIOUS_SERVICE_NAME:-<none>}"
 echo "  SOURCE_REPO_SLUG=$SOURCE_REPO_SLUG"
 echo "  PRIMARY_REPO_SLUG=$PRIMARY_REPO_SLUG"
 echo "  NGINX_SITE_NAME=$NGINX_SITE_NAME"
+echo "  DB_FILE=$DB_FILE"
+echo "  ALLOW_GIT_DB=$ALLOW_GIT_DB"
 
 if [ "$REQUIRE_UNIQUE_NAME" = "true" ] && [ "$SERVICE_NAME" = "cache-api" ]; then
     print_error "SERVICE_NAME=cache-api is not unique for shared VPS use."
@@ -156,6 +161,12 @@ fi
 # Navigate to service directory
 cd "$SERVICE_DIR"
 
+if [ "$ALLOW_GIT_DB" != "true" ] && [ -f "$DB_FILE" ]; then
+    DB_BACKUP_FILE="$(mktemp "/tmp/${SERVICE_NAME}.db.XXXXXX")"
+    cp "$DB_FILE" "$DB_BACKUP_FILE"
+    print_info "Backed up local database $DB_FILE before git update"
+fi
+
 # Check if this is first time setup or update
 if [ ! -d ".git" ]; then
     print_info "First time setup - cloning repository..."
@@ -174,6 +185,12 @@ else
     git checkout -f "$DEPLOY_BRANCH"
     git reset --hard "origin/$DEPLOY_BRANCH"
     print_success "Repository updated"
+fi
+
+if [ -n "$DB_BACKUP_FILE" ] && [ -f "$DB_BACKUP_FILE" ]; then
+    mv "$DB_BACKUP_FILE" "$DB_FILE"
+    DB_BACKUP_FILE=""
+    print_success "Restored preserved database $DB_FILE after git update"
 fi
 
 # Create virtual environment if it doesn't exist
