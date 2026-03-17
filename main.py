@@ -714,6 +714,49 @@ async def get_cache(
         print(f"[ERROR] GET /cache: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
+
+@app.get("/event/check")
+async def check_event_market(
+    event_id: Optional[str] = Query(None, description="Exact internal event_id when known"),
+    date: Optional[str] = Query(None, description="Game date in YYYY-MM-DD format"),
+    sport: Optional[str] = Query(None, description="Optional sport filter"),
+    team: Optional[str] = Query(None, description="One team in the matchup"),
+    opponent: Optional[str] = Query(None, description="The opposing team in the matchup"),
+    market: str = Query(..., description="moneyline, spread, or total"),
+    pick: str = Query(..., description="Pick to evaluate: team/home/away/draw for moneyline or spread, over/under for total"),
+    line: Optional[float] = Query(None, description="Optional custom line; if omitted, stored line is used"),
+    token: str = Depends(verify_token),
+    _: None = Depends(verify_rate_limit),
+) -> JSONResponse:
+    if not event_id and not (date and team and opponent):
+        raise HTTPException(
+            status_code=400,
+            detail="Provide either event_id or date + team + opponent",
+        )
+
+    if _sports_bridge is None or not hasattr(_sports_bridge, "market_check"):
+        raise HTTPException(status_code=503, detail="Event stats service unavailable")
+
+    try:
+        result = await _sports_bridge.market_check(
+            event_id=event_id,
+            date=date,
+            sport=sport,
+            team=team,
+            opponent=opponent,
+            market=market,
+            pick=pick,
+            line=line,
+        )
+        return JSONResponse(status_code=200, content=result)
+    except Exception as exc:
+        status_code = getattr(exc, "status_code", None)
+        if status_code is not None:
+            detail = getattr(exc, "detail", str(exc))
+            raise HTTPException(status_code=status_code, detail=detail)
+        print(f"[WARN] GET /event/check proxy failure: {exc}")
+        raise HTTPException(status_code=503, detail="Event stats service unavailable")
+
 @app.post("/cache/batch")
 async def get_batch_cache(
     request: Request,

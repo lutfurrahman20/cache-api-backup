@@ -98,6 +98,9 @@ test_data/
 test_data.json
 # Local Databases and Logs
 request_logs/
+
+# Local backups (created before git pull to preserve uncommitted changes)
+backup_local_*/
 *.db-shm
 *.db-wal
 uuid_tracking.db

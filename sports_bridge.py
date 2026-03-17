@@ -45,6 +45,13 @@ _TOKEN      = os.getenv("STATS_API_TOKEN", "").strip()
 _TIMEOUT    = float(os.getenv("STATS_API_TIMEOUT", "1.0"))
 _CACHE_TTL  = int(os.getenv("STATS_CACHE_TTL", "300"))
 
+
+class StatsBridgeHTTPError(Exception):
+    def __init__(self, status_code: int, detail: str):
+        super().__init__(detail)
+        self.status_code = status_code
+        self.detail = detail
+
 # ---------------------------------------------------------------------------
 # Redis helper (re-uses the existing redis_cache module)
 # ---------------------------------------------------------------------------
@@ -80,6 +87,12 @@ def _cache_key(player: str | None, team: str | None, sport: str | None) -> str:
     return f"stats_bridge:{raw[:60]}:{h}"
 
 
+def _market_cache_key(params: dict[str, Any]) -> str:
+    raw = json.dumps(params, sort_keys=True, default=str)
+    h = hashlib.md5(raw.encode()).hexdigest()[:12]
+    return f"stats_bridge:market:{h}"
+
+
 # ---------------------------------------------------------------------------
 # HTTP call helpers
 # ---------------------------------------------------------------------------
@@ -104,6 +117,35 @@ async def _get_json(url: str) -> dict[str, Any] | None:
     except Exception as exc:
         log.debug("stats_bridge fetch error for %s: %s", url, exc)
         return None
+
+
+async def _get_json_strict(path: str, params: dict[str, Any]) -> dict[str, Any]:
+    """Async GET that preserves 4xx responses for proxy endpoints."""
+    if not _STATS_URL:
+        raise StatsBridgeHTTPError(503, "Stats service not configured")
+
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+            response = await client.get(f"{_STATS_URL}{path}", headers=_headers(), params=params)
+            if response.status_code == 200:
+                return response.json()
+
+            detail = response.text.strip() or "Stats service request failed"
+            try:
+                payload = response.json()
+                if isinstance(payload, dict) and payload.get("detail"):
+                    detail = str(payload["detail"])
+            except Exception:
+                pass
+
+            status_code = response.status_code if response.status_code in (400, 404, 422) else 503
+            raise StatsBridgeHTTPError(status_code, detail)
+    except StatsBridgeHTTPError:
+        raise
+    except Exception as exc:
+        log.debug("stats_bridge strict fetch error for %s: %s", path, exc)
+        raise StatsBridgeHTTPError(503, "Stats service unavailable") from exc
 
 
 # ---------------------------------------------------------------------------
@@ -186,3 +228,38 @@ async def enrich(
         return result
 
     return None
+
+
+async def market_check(
+    event_id: str | None,
+    date: str | None,
+    sport: str | None,
+    team: str | None,
+    opponent: str | None,
+    market: str,
+    pick: str,
+    line: float | None,
+) -> dict[str, Any]:
+    params = {
+        key: value
+        for key, value in {
+            "event_id": event_id,
+            "date": date,
+            "sport": sport,
+            "team": team,
+            "opponent": opponent,
+            "market": market,
+            "pick": pick,
+            "line": line,
+        }.items()
+        if value is not None
+    }
+
+    cache_key = _market_cache_key(params)
+    cached = _redis_get(cache_key)
+    if cached is not None:
+        return cached
+
+    result = await _get_json_strict("/stats/market-check", params)
+    _redis_set(cache_key, result, _CACHE_TTL)
+    return result

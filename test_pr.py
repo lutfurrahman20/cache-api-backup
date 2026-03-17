@@ -587,6 +587,7 @@ KNOWN_ENDPOINTS = {
     ("DELETE", "/cache/clear"),
     ("DELETE", "/cache/invalidate"),
     ("GET",    "/cache"),
+    ("GET",    "/event/check"),
     ("POST",   "/cache/batch"),
     ("POST",   "/cache/batch/precision"),
     ("GET",    "/leagues"),
@@ -1000,6 +1001,65 @@ class TestIncludeStats:
         data = r.json()
         assert "stats" in data, f"Expected stats key when bridge returns data: {data}"
         assert "stats_unavailable" not in data, "stats_unavailable must not appear when stats is present"
+
+
+class TestEventCheck:
+    def test_event_check_requires_locator(self):
+        r = CLIENT.get(
+            "/event/check",
+            params={"market": "total", "pick": "over", "line": 5.5},
+            headers=user_headers(),
+        )
+        assert r.status_code == 400
+
+    def test_event_check_bridge_unavailable_returns_503(self):
+        with patch("main._sports_bridge", None):
+            r = CLIENT.get(
+                "/event/check",
+                params={
+                    "date": "2026-03-12",
+                    "team": "PSG",
+                    "opponent": "Chelsea",
+                    "market": "total",
+                    "pick": "over",
+                    "line": 5.5,
+                },
+                headers=user_headers(),
+            )
+        assert r.status_code == 503
+
+    def test_event_check_bridge_returns_payload(self):
+        mock_result = {
+            "found": True,
+            "market": "total",
+            "pick": "over",
+            "line": 5.5,
+            "result": True,
+            "outcome": "win",
+        }
+
+        async def _market_check(*a, **kw):
+            return mock_result
+
+        mock_bridge = MagicMock()
+        mock_bridge.market_check = _market_check
+
+        with patch("main._sports_bridge", mock_bridge):
+            r = CLIENT.get(
+                "/event/check",
+                params={
+                    "date": "2026-03-12",
+                    "team": "PSG",
+                    "opponent": "Chelsea",
+                    "market": "total",
+                    "pick": "over",
+                    "line": 5.5,
+                },
+                headers=user_headers(),
+            )
+        assert r.status_code == 200
+        assert r.json().get("result") is True
+        assert r.json().get("outcome") == "win"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
