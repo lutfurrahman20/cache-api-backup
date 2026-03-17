@@ -80,10 +80,12 @@ Thumbs.db
 *.log
 logs/
 
-# Database files
-sports_data.db
+# Database files (when real DB is added)
+# *.db files are tracked via Git LFS
+# Ignore SQLite files except the main database
 *.sqlite
 *.sqlite3
+
 
 
 # ignore test files

@@ -276,13 +276,12 @@ Stats API bridge variables (all optional — leave `STATS_API_URL` blank to disa
 
 `testing.py` event-check defaults (optional overrides for smoke runs):
 
-| Variable               | Default      | Description                                                                                           |
-| ---------------------- | ------------ | ----------------------------------------------------------------------------------------------------- |
-| `EVENT_CHECK_EVENT_ID` | `761496`     | Known event ID used by `testing.py` smoke coverage                                                    |
-| `EVENT_CHECK_DATE`     | `2026-03-12` | Match date used for matchup-based event-check tests                                                   |
-| `EVENT_CHECK_TEAM`     | `PSG`        | Team value used for matchup-based event-check tests                                                   |
-| `EVENT_CHECK_OPPONENT` | `Chelsea`    | Opponent value used for matchup-based event-check tests                                               |
-| `DEPLOY_ALLOW_GIT_DB`  | `false`      | Deploy override. When `false`, VPS preserves its local `sports_data.db` during GitHub Actions deploys |
+| Variable               | Default      | Description                                             |
+| ---------------------- | ------------ | ------------------------------------------------------- |
+| `EVENT_CHECK_EVENT_ID` | `761496`     | Known event ID used by `testing.py` smoke coverage      |
+| `EVENT_CHECK_DATE`     | `2026-03-12` | Match date used for matchup-based event-check tests     |
+| `EVENT_CHECK_TEAM`     | `PSG`        | Team value used for matchup-based event-check tests     |
+| `EVENT_CHECK_OPPONENT` | `Chelsea`    | Opponent value used for matchup-based event-check tests |
 
 CI/CD smoke-test email alert variables (set as GitHub repository secrets):
 
@@ -325,26 +324,11 @@ Notes:
 
 ### Database deployment policy
 
-`sports_data.db` should not be part of routine commits.
+`sports_data.db` is tracked in Git LFS and is included in normal deployments.
 
-- Normal commits and pushes should leave `sports_data.db` untracked
-- VPS deploys preserve the server's existing `sports_data.db` by default, even when Git contents differ
-- If you intentionally want a Git-provided `sports_data.db` to replace the VPS copy, you must opt in explicitly
-
-Intentional database rollout flow:
-
-1. Confirm you really want to replace the VPS database with your local snapshot.
-2. Force-add the database file because it is gitignored:
-
-```bash
-git add -f sports_data.db
-```
-
-3. Commit and push that change normally.
-4. Set the GitHub Actions secret `DEPLOY_ALLOW_GIT_DB=true` before the deploy runs.
-5. After the deploy completes, set `DEPLOY_ALLOW_GIT_DB=false` again so future code-only deploys keep preserving the VPS database.
-
-If you skip step 4, the deploy will still preserve the existing VPS database even if the commit contains `sports_data.db`.
+- If the database file changes locally and you commit it, the next normal push to `main` will deploy that database to the VPS.
+- This is the default behavior for both local Git pushes and GitHub Actions deployments.
+- Use normal Git/LFS workflow when you want schema or league-data changes in `sports_data.db` to reach production.
 
 ### Validation runner
 
