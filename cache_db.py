@@ -1576,6 +1576,10 @@ def get_all_leagues(
         
         leagues_data = []
         for row in results:
+            sport_lower = (row["sport_name"] or "").lower()
+            league_logo_path = os.path.join(os.path.dirname(__file__), "static", "logo", "leagues", sport_lower, f"{row['name']}.png")
+            league_logo_url = f"/static/logo/leagues/{sport_lower}/{row['name']}.png" if os.path.exists(league_logo_path) else None
+
             league_dict = {
                 "id": row["id"],
                 "name": row["name"],
@@ -1585,7 +1589,8 @@ def get_all_leagues(
                 "region": row["region"],
                 "region_code": row["region_code"],
                 "gender": row["gender"],
-                "logo": row["logo"]
+                "logo": row["logo"],
+                "logo_url": league_logo_url
             }
             
             # Get aliases for this league
