@@ -15,6 +15,7 @@ FastAPI service for sports cache normalization with Redis-backed caching, batch 
 - Uses Redis for caching and SQLite for both lookup data and telemetry storage
 - Deploys to VPS through GitHub Actions + `deploy.sh` with fork-safety guards and retry logic
 - **Optional stats enrichment**: `GET /cache?include_stats=true` transparently fetches historical and live statistics from the internal `stats_api` service and merges them into the response — zero overhead when not configured
+- **Live match lookup**: `GET /cache?live=true` or `GET /live` surfaces in-progress and upcoming games from the realtime monitor, filterable by sport, team, or player
 - Exposes `GET /event/check` to evaluate a single event market (`moneyline`, `spread`, `total`) against historical or live data via the internal stats service
 
 ## Tech stack
@@ -162,13 +163,19 @@ The MaxMind database file is required at `geoip/GeoLite2-City.mmdb`. If absent, 
 ### Authenticated (user or admin token)
 
 - `GET /cache`
-  - Query params: `market`, `team`, `player`, `sport`, `league`, `include_stats` (default `false`)
+  - Query params: `market`, `team`, `player`, `sport`, `league`, `include_stats` (default `false`), `live` (default `false`)
   - Validation:
-    - at least one of `market|team|player|league` required
+    - at least one of `market|team|player|league` required (exception: `live=true&sport=<sport>` is valid on its own)
     - `sport` required for team-only searches
     - `sport` required for league searches
   - Returns `404` with `found: false` when no match; missing items are recorded automatically
   - When `include_stats=true` and `STATS_API_URL` is configured, a `stats` key is merged into the `200` response with player/team historical stats and live state. Response shape is otherwise **identical** — existing callers are not affected
+  - When `live=true`, a `live_data` key is added to the response containing current in-progress and upcoming games for the queried team/player/sport (fetched from the realtime monitor). Works standalone (`live=true&sport=basketball`) or combined with `include_stats=true`
+  - **`live=true` standalone with sport** (no other params): skips the cache DB entirely and returns live game data only — useful for a quick "what's live in basketball right now?" query
+  - Examples:
+    - `/cache?team=Lakers&sport=basketball&live=true`
+    - `/cache?team=Lakers&sport=basketball&include_stats=true&live=true`
+    - `/cache?sport=basketball&live=true` (all live basketball games)
 - `POST /cache/batch`
   - Body fields: `team[]`, `player[]`, `market[]`, `sport`, `league[]`
   - Independent lookup per category; each item resolves separately
@@ -180,6 +187,19 @@ The MaxMind database file is required at `geoip/GeoLite2-City.mmdb`. If absent, 
 - `GET /leagues`
   - Query params: `sport`, `search`, `region`
   - Partial-match search, priority-ordered results (top 5 leagues first)
+- `GET /live`
+  - Query params: `sport`, `team`, `player`, `status` (`live` | `pregame` | omit for both)
+  - Returns all games currently tracked by the realtime monitor
+  - Requires `STATS_API_URL` to be configured; returns `503` if the stats service is unavailable
+  - `status=live` — in-progress games only; `status=pregame` — upcoming games only
+  - Sport filter is applied client-side after fetching from the stats service
+  - Response: `{ found, live_count, pregame_count, live[], pregame[], source, filters }`
+  - Examples:
+    - `/live` (all tracked games)
+    - `/live?status=live` (only in-progress games right now)
+    - `/live?sport=basketball` (all basketball live + pregame)
+    - `/live?sport=basketball&status=live`
+    - `/live?team=Lakers` (Lakers' next/current game)
 - `GET /event/check`
   - Query params:
     - locator: either `event_id`, or `date` + `team` + `opponent`
@@ -308,11 +328,22 @@ Notes:
 
 ### How it works
 
-1. A caller adds `?include_stats=true` to any `GET /cache` request.
-2. If `STATS_API_URL` is set, `sports_bridge.enrich(player, team, sport)` is called after the normal cache lookup succeeds.
-3. The bridge queries up to four stats endpoints — `/stats/player`, `/stats/team`, `/stats/live`, `/stats/market-check` — using the same identifiers already present in the request.
+1. A caller adds `?include_stats=true` and/or `?live=true` to any `GET /cache` request.
+2. If `STATS_API_URL` is set, `sports_bridge.enrich(player, team, sport)` is called after the normal cache lookup succeeds (for `include_stats=true`).
+3. The bridge queries up to three stats endpoints — `/stats/player`, `/stats/team`, `/stats/live` — using the same identifiers already present in the request.
 4. Results are cached in Redis under `stats_bridge:*` keys (separate namespace, no collision with `cache:*` keys) with a configurable TTL (`STATS_CACHE_TTL`, default 5 min).
 5. The merged `stats` object is appended to the existing response. If the stats service is unavailable, the original response is returned unchanged.
+6. When `live=true` is passed, `sports_bridge.fetch_live(team, player, sport)` is called separately to get the freshest game state (bypasses the `enrich` cache to avoid stale live data). Result is placed in `live_data` on the response, or merged into `stats.live` when `include_stats=true` is also present.
+
+### Live game fetching
+
+`sports_bridge.fetch_live(team, player, sport)` — called by both `GET /cache?live=true` and `GET /live`.
+
+- Calls `/stats/live` on the internal stats service with optional `team`/`player` filter params
+- Sport filtering is applied client-side (the stats service has no `sport` query param)
+- Returns `{ live_count, pregame_count, live[], pregame[], source }` — never raises
+- Returns `source: "unavailable"` with empty lists when `STATS_API_URL` is not configured or the service is down
+- Not cached in Redis (live data should always be fresh)
 
 ### Event market checks
 
@@ -347,10 +378,10 @@ python testing.py --target prod --token <user_token> --admin-token <admin_token>
 
 | Guarantee                       | Detail                                                                                                                                                       |
 | ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| **Zero overhead when disabled** | If `STATS_API_URL` is not set, `enrich()` returns `None` immediately — no network activity, no latency                                                       |
+| **Zero overhead when disabled** | If `STATS_API_URL` is not set, `enrich()` and `fetch_live()` return immediately — no network activity, no latency                                            |
 | **Hard timeout**                | `STATS_API_TIMEOUT` (default 1 s) caps every fetch — a slow stats service can never stall a production response                                              |
-| **Never raises**                | All exceptions (timeout, connection refused, JSON parse, Redis errors) are caught and logged at `DEBUG` level; the function returns `None`                   |
-| **Opt-in only**                 | `include_stats` defaults to `false` — all existing API callers see zero change                                                                               |
+| **Never raises**                | All exceptions (timeout, connection refused, JSON parse, Redis errors) are caught and logged at `DEBUG` level; the functions return `None` or empty payloads |
+| **Opt-in only**                 | `include_stats` and `live` both default to `false` — all existing API callers see zero change                                                                |
 | **Import-safe**                 | `sports_bridge` is imported inside a `try/except` at startup; if `httpx` is missing or the module fails, `_sports_bridge = None` and the app starts normally |
 
 ### Example enriched response
@@ -478,7 +509,7 @@ Distinct endpoints covered in full mode:
 Endpoint list covered:
 
 - `/`, `/docs`, `/openapi.json`
-- `/cache`, `/cache/batch`, `/cache/batch/precision`, `/leagues`
+- `/cache`, `/cache/batch`, `/cache/batch/precision`, `/leagues`, `/live`
 - `/health`, `/cache/stats`, `/cache/invalidate`
 - `/admin/dashboard`, `/admin/logs`, `/admin/sessions`, `/admin/stats/cache`
 - `/admin/tokens`, `/admin/tokens/audit`
@@ -489,8 +520,9 @@ Endpoint list covered:
 
 Current suite includes the following parameter/body combination coverage:
 
-- `GET /cache`: `15` query combinations
+- `GET /cache`: `18` query combinations
   - includes valid and validation-error cases (`team` without `sport`, `league` without `sport`)
+  - includes `live=true` standalone, `live=true` + team, `live=true` + `include_stats=true`
 - `POST /cache/batch`: `5` body combinations
   - includes mixed and sparse payloads across team/player/market/league/sport
 - `POST /cache/batch/precision`: `3` precision query-set combinations

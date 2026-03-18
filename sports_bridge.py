@@ -230,6 +230,61 @@ async def enrich(
     return None
 
 
+async def fetch_live(
+    team:   str | None = None,
+    player: str | None = None,
+    sport:  str | None = None,
+) -> dict[str, Any]:
+    """
+    Fetch current live and pregame games directly from the stats service.
+
+    When *team*, *player*, or *sport* are given, results are filtered to only
+    matching games.  Omit all three to return every game currently tracked.
+
+    Returns a dict with:
+        live_count  — number of in-progress games
+        pregame_count — number of upcoming games
+        live        — list of in-progress game objects
+        pregame     — list of upcoming game objects
+        source      — "sports_stats_api" | "unavailable"
+
+    Never raises.
+    """
+    if not _STATS_URL:
+        return {"live_count": 0, "pregame_count": 0, "live": [], "pregame": [], "source": "unavailable"}
+
+    params: list[str] = []
+    if team:
+        params.append(f"team={team}")
+    if player:
+        params.append(f"player={player}")
+
+    url = f"{_STATS_URL}/stats/live"
+    if params:
+        url += "?" + "&".join(params)
+
+    data = await _get_json(url)
+    if data is None:
+        return {"live_count": 0, "pregame_count": 0, "live": [], "pregame": [], "source": "unavailable"}
+
+    live_list    = data.get("live", [])
+    pregame_list = data.get("pregame", [])
+
+    # Client-side sport filter (stats/live has no sport param)
+    if sport:
+        sport_lower = sport.lower()
+        live_list    = [g for g in live_list    if g.get("sport", "").lower() == sport_lower]
+        pregame_list = [g for g in pregame_list if g.get("sport", "").lower() == sport_lower]
+
+    return {
+        "live_count":    len(live_list),
+        "pregame_count": len(pregame_list),
+        "live":          live_list,
+        "pregame":       pregame_list,
+        "source":        "sports_stats_api",
+    }
+
+
 async def market_check(
     event_id: str | None,
     date: str | None,

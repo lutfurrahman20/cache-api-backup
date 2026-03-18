@@ -567,6 +567,7 @@ async def get_cache(
     sport: Optional[str] = Query(None, description="Sport name (required when searching by team or league)"),
     league: Optional[str] = Query(None, description="League name to look up"),
     include_stats: bool = Query(False, description="Enrich response with historical/live stats (requires STATS_API_URL)"),
+    live: bool = Query(False, description="Return live/pregame game state for the queried team or player (requires STATS_API_URL). When used alone with sport, returns all live games for that sport."),
     token: str = Depends(verify_token),
     _: None = Depends(verify_rate_limit)
 ) -> JSONResponse:
@@ -579,18 +580,43 @@ async def get_cache(
     - player: Player name to normalize
     - sport: Sport name (required when searching by team or league only)
     - league: League name to normalize
+    - include_stats: Enrich with historical stats + live state (stats.live section)
+    - live: Shortcut to include current live/pregame match data in the response.
+            Works standalone (live=true&sport=basketball) or alongside include_stats=true.
     
     Returns:
     - Mapped/normalized entry from cache database
     
     Examples:
     - /cache?team=Lakers&sport=Basketball
+    - /cache?team=Lakers&sport=Basketball&live=true
+    - /cache?team=Lakers&sport=Basketball&include_stats=true&live=true
+    - /cache?sport=basketball&live=true   (all live basketball games, no cache lookup)
     - /cache?league=Premier League&sport=Soccer
     - /cache?player=LeBron James
     - /cache?market=moneyline
     """
-    
+
+    # When live=true is combined with include_stats, skip re-fetching live inside enrich
+    # (we already fetch it separately below for a consistent single source of truth).
+
     # Validate that at least one parameter is provided
+    # Exception: live=true with sport is valid on its own (no cache lookup needed)
+    if live and not any([market, team, player, league]) and sport:
+        # Live-only query for a sport — skip cache DB, go straight to live data
+        if _sports_bridge is None:
+            raise HTTPException(status_code=503, detail="Live stats service not configured (STATS_API_URL missing)")
+        try:
+            live_result = await _sports_bridge.fetch_live(sport=sport)
+        except Exception as exc:
+            print(f"[WARN] /cache live-only fetch failed: {exc}")
+            raise HTTPException(status_code=503, detail="Live stats service unavailable")
+        return JSONResponse(status_code=200, content={
+            "found": True,
+            "live_data": live_result,
+            "query": {"sport": sport, "live": True},
+        })
+
     if not any([market, team, player, league]):
         raise HTTPException(
             status_code=400,
@@ -708,6 +734,24 @@ async def get_cache(
         elif include_stats and _sports_bridge is None:
             response_content["stats_unavailable"] = True
 
+        # Live data — fetched when live=true (and not already included via include_stats)
+        if live and _sports_bridge is not None:
+            try:
+                live_result = await _sports_bridge.fetch_live(team=team, player=player, sport=sport)
+                # If include_stats already populated stats.live, merge rather than duplicate
+                if include_stats and "stats" in response_content and isinstance(response_content.get("stats"), dict):
+                    response_content["stats"]["live"] = {
+                        "live":    live_result.get("live", []),
+                        "pregame": live_result.get("pregame", []),
+                    }
+                else:
+                    response_content["live_data"] = live_result
+            except Exception as _live_exc:
+                print(f"[WARN] live fetch failed (non-critical): {_live_exc}")
+                response_content["live_data_unavailable"] = True
+        elif live and _sports_bridge is None:
+            response_content["live_data_unavailable"] = True
+
         return JSONResponse(status_code=200, content=response_content)
         
     except Exception as e:
@@ -756,6 +800,65 @@ async def check_event_market(
             raise HTTPException(status_code=status_code, detail=detail)
         print(f"[WARN] GET /event/check proxy failure: {exc}")
         raise HTTPException(status_code=503, detail="Event stats service unavailable")
+
+
+@app.get("/live")
+async def get_live_games(
+    sport: Optional[str] = Query(None, description="Filter by sport (e.g. basketball, soccer, hockey, baseball)"),
+    team: Optional[str] = Query(None, description="Filter to a specific team (partial name match)"),
+    player: Optional[str] = Query(None, description="Filter to a specific player (partial name match)"),
+    status: Optional[str] = Query(None, description="Filter by game status: 'live' (in-progress only) or 'pregame' (upcoming only). Omit for both."),
+    token: str = Depends(verify_token),
+    _: None = Depends(verify_rate_limit),
+) -> JSONResponse:
+    """
+    Return current live and/or pregame matches tracked by the realtime monitor.
+
+    Requires STATS_API_URL to be configured.
+
+    Parameters:
+    - sport:   Filter by sport name (basketball, soccer, hockey, baseball, cricket)
+    - team:    Partial team name filter (e.g. 'Lakers', 'Arsenal')
+    - player:  Partial player name filter
+    - status:  'live' → in-progress only | 'pregame' → upcoming only | omit → both
+
+    Examples:
+    - /live                           (all tracked games)
+    - /live?status=live               (only in-progress games right now)
+    - /live?sport=basketball          (all basketball live+pregame)
+    - /live?sport=basketball&status=live
+    - /live?team=Lakers               (Lakers' current or upcoming game)
+    """
+    if _sports_bridge is None:
+        raise HTTPException(status_code=503, detail="Live stats service not configured (STATS_API_URL missing)")
+
+    try:
+        result = await _sports_bridge.fetch_live(team=team, player=player, sport=sport)
+    except Exception as exc:
+        print(f"[WARN] GET /live fetch failed: {exc}")
+        raise HTTPException(status_code=503, detail="Live stats service unavailable")
+
+    # Apply status filter
+    if status == "live":
+        result = {**result, "pregame": [], "pregame_count": 0}
+    elif status == "pregame":
+        result = {**result, "live": [], "live_count": 0}
+
+    return JSONResponse(status_code=200, content={
+        "found": result["live_count"] > 0 or result["pregame_count"] > 0,
+        "live_count":    result["live_count"],
+        "pregame_count": result["pregame_count"],
+        "live":          result["live"],
+        "pregame":       result["pregame"],
+        "source":        result.get("source", "sports_stats_api"),
+        "filters": {
+            "sport":  sport,
+            "team":   team,
+            "player": player,
+            "status": status,
+        },
+    })
+
 
 @app.post("/cache/batch")
 async def get_batch_cache(
