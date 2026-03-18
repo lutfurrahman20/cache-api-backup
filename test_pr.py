@@ -640,6 +640,8 @@ KNOWN_ENDPOINTS = {
     ("GET",    "/admin/analytics/latency"),
     ("GET",    "/admin/analytics/signatures"),
     ("GET",    "/admin/analytics/trends"),
+    # Live endpoint
+    ("GET",    "/live"),
 }
 
 KNOWN_CACHE_DB_FUNCTIONS = {
@@ -1160,6 +1162,150 @@ class TestEventCheck:
         assert data.get("event", {}).get("event_id") == "761496"
         assert data.get("score", {}).get("total") == 6
         assert "pricing" in data
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GET /live endpoint
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestLiveEndpoint:
+    def test_live_no_token_returns_401_or_403(self):
+        r = CLIENT.get("/live")
+        assert r.status_code in (401, 403), (
+            f"Expected 401/403 with no token, got {r.status_code}"
+        )
+
+    def test_live_wrong_token_returns_401_or_403(self):
+        r = CLIENT.get("/live", headers={"Authorization": "Bearer wrong-token"})
+        assert r.status_code in (401, 403), (
+            f"Expected 401/403 with wrong token, got {r.status_code}"
+        )
+
+    def test_live_bridge_unavailable_returns_503(self):
+        with patch("main._sports_bridge", None):
+            r = CLIENT.get("/live", headers=user_headers())
+        assert r.status_code == 503, (
+            f"Expected 503 when bridge is None, got {r.status_code}"
+        )
+
+    def test_live_bridge_returns_data_shape(self):
+        mock_payload = {
+            "live_count": 1,
+            "pregame_count": 2,
+            "live": [{"event_id": "123", "sport": "basketball", "status": "live"}],
+            "pregame": [
+                {"event_id": "124", "sport": "basketball", "status": "pregame"},
+                {"event_id": "125", "sport": "basketball", "status": "pregame"},
+            ],
+            "source": "sports_api",
+        }
+
+        async def _fetch_live(*a, **kw):
+            return mock_payload
+
+        mock_bridge = MagicMock()
+        mock_bridge.fetch_live = _fetch_live
+        with patch("main._sports_bridge", mock_bridge):
+            r = CLIENT.get("/live", headers=user_headers())
+        assert r.status_code == 200
+        data = r.json()
+        assert "found" in data
+        assert "live_count" in data
+        assert "pregame_count" in data
+        assert "live" in data
+        assert "pregame" in data
+        assert "source" in data
+        assert "filters" in data
+        assert data["live_count"] == 1
+        assert data["pregame_count"] == 2
+
+    def test_live_status_filter_live_only(self):
+        mock_payload = {
+            "live_count": 1,
+            "pregame_count": 2,
+            "live": [{"event_id": "123", "sport": "basketball", "status": "live"}],
+            "pregame": [
+                {"event_id": "124", "sport": "basketball", "status": "pregame"},
+                {"event_id": "125", "sport": "basketball", "status": "pregame"},
+            ],
+            "source": "sports_api",
+        }
+
+        async def _fetch_live(*a, **kw):
+            return mock_payload
+
+        mock_bridge = MagicMock()
+        mock_bridge.fetch_live = _fetch_live
+        with patch("main._sports_bridge", mock_bridge):
+            r = CLIENT.get("/live", params={"status": "live"}, headers=user_headers())
+        assert r.status_code == 200
+        data = r.json()
+        assert data["pregame"] == [], "pregame must be empty when status=live"
+        assert data["pregame_count"] == 0
+        assert len(data["live"]) == 1
+
+    def test_live_status_filter_pregame_only(self):
+        mock_payload = {
+            "live_count": 1,
+            "pregame_count": 2,
+            "live": [{"event_id": "123", "sport": "basketball", "status": "live"}],
+            "pregame": [
+                {"event_id": "124", "sport": "basketball", "status": "pregame"},
+                {"event_id": "125", "sport": "basketball", "status": "pregame"},
+            ],
+            "source": "sports_api",
+        }
+
+        async def _fetch_live(*a, **kw):
+            return mock_payload
+
+        mock_bridge = MagicMock()
+        mock_bridge.fetch_live = _fetch_live
+        with patch("main._sports_bridge", mock_bridge):
+            r = CLIENT.get("/live", params={"status": "pregame"}, headers=user_headers())
+        assert r.status_code == 200
+        data = r.json()
+        assert data["live"] == [], "live must be empty when status=pregame"
+        assert data["live_count"] == 0
+        assert len(data["pregame"]) == 2
+
+    def test_live_returns_found_true_when_games_exist(self):
+        mock_payload = {
+            "live_count": 1,
+            "pregame_count": 0,
+            "live": [{"event_id": "99", "sport": "soccer", "status": "live"}],
+            "pregame": [],
+            "source": "sports_api",
+        }
+
+        async def _fetch_live(*a, **kw):
+            return mock_payload
+
+        mock_bridge = MagicMock()
+        mock_bridge.fetch_live = _fetch_live
+        with patch("main._sports_bridge", mock_bridge):
+            r = CLIENT.get("/live", headers=user_headers())
+        assert r.status_code == 200
+        assert r.json()["found"] is True
+
+    def test_live_returns_found_false_when_no_games(self):
+        mock_payload = {
+            "live_count": 0,
+            "pregame_count": 0,
+            "live": [],
+            "pregame": [],
+            "source": "sports_api",
+        }
+
+        async def _fetch_live(*a, **kw):
+            return mock_payload
+
+        mock_bridge = MagicMock()
+        mock_bridge.fetch_live = _fetch_live
+        with patch("main._sports_bridge", mock_bridge):
+            r = CLIENT.get("/live", headers=user_headers())
+        assert r.status_code == 200
+        assert r.json()["found"] is False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
